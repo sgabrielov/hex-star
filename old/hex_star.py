@@ -1,4 +1,4 @@
-from math import sqrt, pi, inf
+from math import sqrt, pi
 from queue import PriorityQueue
 from itertools import count
 from copy import copy
@@ -33,10 +33,9 @@ def best_first_search(problem, f, h):
 
 def inf_bidirectional_search(problem, f, f2, h, h2):
     #state, frontier, and reached declaraiton
-    #node_f = problem.Node((problem.root.state[0], (0,0)), None, None, 0, problem)
-    node_f = problem.Node(problem.root.state, None, None, 0, problem)
+    node_f = problem.Node((problem.root.state[0], (0,0)), None, None, 0, problem)
     #print("Init: ", node_f.state[0])
-    node_g = problem.Node(problem.goal.state, None, None, 0, problem)
+    node_g = problem.Node((problem.goal_loc, (0,pi)), None, None, 0, problem)
     #print("Init: ", node_g.state[0])
     frontier_f = PriorityQueue(0)
     frontier_f.put((f(node_f, h), -next(counter), node_f))
@@ -44,63 +43,49 @@ def inf_bidirectional_search(problem, f, f2, h, h2):
     frontier_g.put((f2(node_g, h2), -next(counter), node_g))
     reached_f = {node_f.state: node_f}
     reached_g = {node_g.state: node_g}
-    #reached_f2 = {node_f.state[0]: node_f}
-    #reached_g2 = {node_g.state[0]: node_g}
-    reached_f2 = {
-        (
-            node_f.state[0], # location
-            int(node_f.state[1][1]) # direction
-        ): node_f
-    }
-    reached_g2 = {
-        (
-            node_g.state[0], # location
-            int(node_g.state[1][1]) # direction
-        ): node_g
-    }
-    direction = ""  
+    reached_f2 = [node_f.state[0]]
+    reached_g2 = [node_g.state[0]]
+    dir = ""
     solution = None
     while not frontier_f.empty() and not frontier_g.empty():
         #problem could be from pulling from fontier items
         if frontier_f.queue[0][0] < frontier_g.queue[0][0]:
-            direction = "f"
+            dir = "f"
             node_f = frontier_f.get(False)[2]
-            if ( node_f.state[0], int((node_f.state[1][1] + pi) % (2 * pi) )) in reached_g2:
-                return Termination(direction, problem, node_f, reached_g, h)
-            inf_bidirectional_proceed(direction, problem, node_f, frontier_f, reached_f, reached_f2, h)
+            if node_f.state[0] in reached_g2:
+                return Termination(dir, problem, node_f, reached_g, h)
+            inf_bidirectional_proceed(dir, problem, node_f, frontier_f, reached_f, reached_f2, h)
         else:
-            direction = "b"
+            dir = "b"
             node_g = frontier_g.get(False)[2]
-            if ( node_g.state[0], int((node_g.state[1][1] + pi) % (2 * pi) )) in reached_f2:
-                return Termination(direction, problem, node_g, reached_f, h2)
-            inf_bidirectional_proceed(direction, problem, node_g, frontier_g, reached_g, reached_g2, h2)
+            if node_g.state[0] in reached_f2:
+                return Termination(dir, problem, node_g, reached_f, h2)
+            inf_bidirectional_proceed(dir, problem, node_g, frontier_g, reached_g, reached_g2, h2)
     return solution
 
-
-
-def Termination(direction, problem, node, reached, h):
+def Termination(dir, problem, node, reached, h):
     print("meeting point: ", node.state[0])
     temp = {key: val for key, val in reached.items() if val.state[0] == node.state[0]}
     temp_queue = PriorityQueue(0)
     for key, val in temp.items():
-        if direction == "f":
+        if dir == "f":
             temp_queue.put((f(temp[key], h), val))
         else:
             temp_queue.put((f2(temp[key], h), val))
-    if direction == "f":
+    if dir == "f":
         return bi_join_nodes(node, temp_queue.get(False)[1])
     else:
         return bi_join_nodes(temp_queue.get(False)[1], node)
 
-def inf_bidirectional_proceed(direction, problem, node, frontier, reached, reached2, h):
+def inf_bidirectional_proceed(dir, problem, node, frontier, reached, reached2, h):
     if node.state[0] not in reached2:
-        reached2[(node.state[0], int(node.state[1][1]))] = node
+        reached2.append(node.state[0])
     for child in expand(problem, node, h):
         s = child.state
         if s not in reached or child.path_cost < reached[s].path_cost:
             #print(dir, s[0])
             reached[s] = child
-            if direction == "f":
+            if dir == "f":
                 frontier.put((f(child, h), -next(counter), child))
             else:
                 frontier.put((f2(child, h), -next(counter), child))
@@ -198,6 +183,7 @@ class PathfindingProblem:
             self.path_cost = path_cost
 
             self.problem = problem
+
             
 
             # if the new node has a different angle than previous
@@ -250,13 +236,8 @@ class PathfindingProblem:
         
         def __str__(self):
             return str(self.state)
-    def __init__(self, initial_state_f, initial_state_b, hex_map, obstacle_map, goal_loc, hex_radius, hex_size, agent_size_r, acceleration_max, deceleration_max, lat_acceleration_max):
-        # Defines the indices for the components of the state
-        self.state_dict = {
-            'agent': 0,
-            'velocity': 1,
-        }
-        
+    def __init__(self, initial_state, hex_map, obstacle_map, goal_loc, hex_radius, hex_size, acceleration_max, deceleration_max, lat_acceleration_max):
+        self.root = self.Node(initial_state, None, None, 0, self)
         self.hex_map = hex_map
         self.obstacle_map = obstacle_map
         self.goal_loc = goal_loc
@@ -265,23 +246,17 @@ class PathfindingProblem:
         self.a_max = acceleration_max
         self.d_max = deceleration_max
         self.ay_max = lat_acceleration_max
-        self.agent_size_r = agent_size_r
-        self.root = self.Node(initial_state_f, None, None, 0, self)
-        init_loc, init_v = initial_state_b
-        init_s, init_d = init_v
-        
-        initial_state_b = (
-            init_loc,
-            (init_s, init_d + pi)
-        )
-        self.goal = self.Node(initial_state_b, None, None, 0, self)
-        
 
         # for benchmarking
         self.heuristic_consistent_flag = True
         self.num_expanded_states = 0
         self.num_generated_nodes = 0
 
+        # Defines the indices for the components of the state
+        self.state_dict = {
+            'agent': 0,
+            'velocity': 1
+        }
 
         # Defines the directions to the immediate neighborhood and their angle relative to horizontal
         self.neighborhood_angles = {
@@ -292,20 +267,8 @@ class PathfindingProblem:
             (0,-1): 4*pi/3,
             (1,-1): 5*pi/3   
         }
-    def check_collision(self, state):
-        # initialize at r=0 and node to check if the node itself is an obstacle
-        max_r = self.agent_size_r
-        r = 0
-        r_neighbors = {state}
-        while r_neighbors and r <= max_r: 
-            if r_neighbors & self.obstacle_map != set():
-                return True
-            r = r + 1
-            r_neighbors = {h for h in self.hex_map if self.hex_manhattan_distance(h, state) == r}
-        # if there are no neighbors at this r, then end the search because r is out of bounds for the map
-        return False
-    def hex_manhattan_distance_2(self, hex1, hex2):
-        print("\nhex1: ", hex1, type(hex1), "\nhex2: ", hex2, type(hex2))
+    def hex_manhattan_distance(self, hex1, hex2):
+        #print("\nhex1: ", hex1, type(hex1), "\nhex2: ", hex2, type(hex2))
         q1, r1 = hex1
         q2, r2 = hex2
 
@@ -314,13 +277,6 @@ class PathfindingProblem:
         ds = abs(-q1-q2-r1-r2)
 
         return (dq+dr+ds)/2
-
-    def hex_manhattan_distance(self, hex1, hex2):
-        q1, r1 = hex1
-        q2, r2 = hex2
-        return (abs(q1 - q2) 
-          + abs(q1 + r1 - q2 - r2)
-          + abs(r1 - r2)) / 2
 
     # get the path cost of applying action to state
     def action_cost(self, state, action):
@@ -367,10 +323,10 @@ class PathfindingProblem:
 
         # Remove obstacles and out of bounds locations from the action list
         actions = [a for a in actions 
-                   # if self.add_locations(a, state[self.state_dict['agent']]) not in self.obstacle_map # New hex is not an obstacle
-                   if not self.check_collision(self.add_locations(a, state[self.state_dict['agent']]))
+                   if self.add_locations(a, state[self.state_dict['agent']]) not in self.obstacle_map
                    and self.hex_manhattan_distance(self.add_locations(a, state[self.state_dict['agent']]), (0,0)) <= self.hex_radius
                   ]
+        
         return actions
 
     # returns the result of applying action to state
@@ -405,5 +361,4 @@ class PathfindingProblem:
     
     def get_benchmarks(self):
         return (self.heuristic_consistent_flag, self.num_expanded_states, self.num_generated_nodes)
-
         
