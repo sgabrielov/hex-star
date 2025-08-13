@@ -199,23 +199,33 @@ class PathfindingProblem:
 
             self.problem = problem
 
-            # [1 - 12]
-
-            # 1 -> 0 r
-            # 2 -> 1/6 pi
             self.route_direction = self.get_path_direction()
 
             # if the new node has a different angle than previous
             # the agent turned, apply the turning penalty and backtrack to update velocities and path costs along the path
-            if self.is_turn() and not self.is_zigzag():
+            # if self.is_turn() and not self.is_zigzag():
+            #     r = 1
+            #     current_node = self.parent
+            #     while not current_node.is_turn() and current_node.is_zigzag():
+            #         current_node = current_node.parent
+            #         r += 1
+
+            if self.parent is not None and self.route_direction != self.parent.route_direction:
+
                 r = 1
+
+                # count the number of nodes until the previous turn
                 current_node = self.parent
-                while not current_node.is_turn() and current_node.is_zigzag():
+                while current_node.route_direction != current_node.parent.route_direction:
                     current_node = current_node.parent
                     r += 1
+                if abs(self.route_direction- self.parent.route_direction)==1 :
+                    r *= 2
+
+                
                 
                 # calculate the max velocity for the turn
-                v_max = sqrt(2*r * problem.ay_max)
+                v_max = sqrt(r * problem.ay_max)
                 if state[1][0] > v_max:
                     # update the velocity in the current node to v_max
                     self.state = (
@@ -223,6 +233,7 @@ class PathfindingProblem:
                         (v_max, self.state[problem.state_dict['velocity']][1])
                     )
                 self.update_velocity(problem)
+                
         def get_node_direction(self):
             return self.state[self.problem.state_dict['velocity']][1]
         def get_path_direction(self):
@@ -258,9 +269,14 @@ class PathfindingProblem:
 
 
             # If this node has no parent, then it is the root node and the path direction is just the starting velocity direction
-            if self.parent is None:
-                return node_direction_idx_dict[self.get_node_direction()]
+            # if self.parent is None:
+            #     return node_direction_idx_dict[self.get_node_direction()]
             node_direction = self.get_node_direction()
+            
+            if self.parent is None or self.parent.parent is None:
+                return -1
+                
+ 
 
             # If this node has no grandparent, then it is the second node in the path, which means we do not know yet if it is part of a 
             #   zig-zag path or a normal path. In order to avoid unfairly penalizing paths that happen to start in zig-zag directions, we
@@ -283,7 +299,7 @@ class PathfindingProblem:
                 # If a node and its grandparent have the same direction, but it's not the same as the parent, then these three nodes form a zig-zag shape
                 # However, to be sure that this is part of a zig-zag path, we need to make sure the parent makes a zig shape too
 
-                # If a great grandparent exists, store it's direction
+                # If a great grandparent exists, store its direction
                 if self.parent.parent.parent is not None: 
                     g_grandparent_direction = self.parent.parent.parent.get_node_direction()
                     
@@ -308,7 +324,7 @@ class PathfindingProblem:
 
             
         def update_velocity(self, problem):
-            current_node = self
+            current_node = self.parent.parent
             while current_node.parent:
                 new_v = problem.calculate_velocity(current_node.state[problem.state_dict['velocity']][0], problem.d_max, sqrt(3) * problem.hex_size)
                 if new_v < current_node.parent.state[problem.state_dict['velocity']][0]:
@@ -330,6 +346,22 @@ class PathfindingProblem:
                 else:
                     break
             
+            # Update the parent's velocity
+            parent_copy = copy(self.parent)
+            v = parent_copy.parent.state[problem.state_dict['velocity']][0]        
+            new_v = problem.calculate_velocity(v, problem.a_max, sqrt(3) * problem.hex_size)
+            parent_copy.state = (
+                parent_copy.state[0],
+                (new_v, parent_copy.state[problem.state_dict['velocity']][1])
+            )
+            # Finally update this node
+            v = new_v
+            new_v = problem.calculate_velocity(v, problem.a_max, sqrt(3) * problem.hex_size)
+            self.state = (
+                self.state[0],
+                (new_v, self.state[problem.state_dict['velocity']][1])
+            )
+
         def is_turn(self):
             return self.parent is not None and self.state[self.problem.state_dict['velocity']][1] != self.parent.state[self.problem.state_dict['velocity']][1]
         def is_zigzag(self):
@@ -338,6 +370,11 @@ class PathfindingProblem:
         
         def __str__(self):
             return str(self.state)
+
+        def __lt__(self, other):
+            return f(self) < f(other)
+        def __gt__(self, other):
+            return f(self) > f(other)
     def __init__(self, initial_state_f, initial_state_b, hex_map, obstacle_map, goal_loc, hex_radius, hex_size, agent_size_r, acceleration_max, deceleration_max, lat_acceleration_max):
         # Defines the indices for the components of the state
         self.state_dict = {
@@ -389,9 +426,21 @@ class PathfindingProblem:
             if r_neighbors & self.obstacle_map != set():
                 return True
             r = r + 1
-            r_neighbors = {h for h in self.hex_map if self.hex_manhattan_distance(h, state) == r}
+            r_neighbors = self.get_neighbors_at_radius(state,r)
         # if there are no neighbors at this r, then end the search because r is out of bounds for the map
         return False
+
+    def get_neighbors_at_radius(self, center, radius):
+        directions = [(-1,1),(-1,0),(0,-1), (1,-1), (1,0)]
+        newloc = self.add_locations(center, tuple([a*radius for a in (1,0)]))
+        locs = set()
+        locs.add(newloc)
+        for direction in directions:
+            for i in range(radius):
+                newloc = self.add_locations(newloc, direction)
+                locs.add(newloc)
+        return locs
+    
     def hex_manhattan_distance_2(self, hex1, hex2):
         print("\nhex1: ", hex1, type(hex1), "\nhex2: ", hex2, type(hex2))
         q1, r1 = hex1
