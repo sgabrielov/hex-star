@@ -199,33 +199,23 @@ class PathfindingProblem:
 
             self.problem = problem
 
+            # [1 - 12]
+
+            # 1 -> 0 r
+            # 2 -> 1/6 pi
             self.route_direction = self.get_path_direction()
 
             # if the new node has a different angle than previous
             # the agent turned, apply the turning penalty and backtrack to update velocities and path costs along the path
-            # if self.is_turn() and not self.is_zigzag():
-            #     r = 1
-            #     current_node = self.parent
-            #     while not current_node.is_turn() and current_node.is_zigzag():
-            #         current_node = current_node.parent
-            #         r += 1
-
             if self.parent is not None and self.route_direction != self.parent.route_direction:
-
                 r = 1
-
-                # count the number of nodes until the previous turn
                 current_node = self.parent
-                while current_node.route_direction != current_node.parent.route_direction:
+                while not current_node.is_turn() and current_node.is_zigzag():
                     current_node = current_node.parent
                     r += 1
-                if abs(self.route_direction- self.parent.route_direction)==1 :
-                    r *= 2
-
-                
                 
                 # calculate the max velocity for the turn
-                v_max = sqrt(r * problem.ay_max)
+                v_max = sqrt(2*r * problem.ay_max)
                 if state[1][0] > v_max:
                     # update the velocity in the current node to v_max
                     self.state = (
@@ -233,7 +223,8 @@ class PathfindingProblem:
                         (v_max, self.state[problem.state_dict['velocity']][1])
                     )
                 self.update_velocity(problem)
-                
+
+        
         def get_node_direction(self):
             return self.state[self.problem.state_dict['velocity']][1]
         def get_path_direction(self):
@@ -269,14 +260,9 @@ class PathfindingProblem:
 
 
             # If this node has no parent, then it is the root node and the path direction is just the starting velocity direction
-            # if self.parent is None:
-            #     return node_direction_idx_dict[self.get_node_direction()]
+            if self.parent is None:
+                return node_direction_idx_dict[self.get_node_direction()]
             node_direction = self.get_node_direction()
-            
-            if self.parent is None or self.parent.parent is None:
-                return -1
-                
- 
 
             # If this node has no grandparent, then it is the second node in the path, which means we do not know yet if it is part of a 
             #   zig-zag path or a normal path. In order to avoid unfairly penalizing paths that happen to start in zig-zag directions, we
@@ -294,37 +280,49 @@ class PathfindingProblem:
                 return node_direction_idx_dict[node_direction]
 
             # check for zig-zag paths
-            if node_direction == grandparent_direction:
+            if node_direction != parent_direction:
 
                 # If a node and its grandparent have the same direction, but it's not the same as the parent, then these three nodes form a zig-zag shape
                 # However, to be sure that this is part of a zig-zag path, we need to make sure the parent makes a zig shape too
 
-                # If a great grandparent exists, store its direction
-                if self.parent.parent.parent is not None: 
-                    g_grandparent_direction = self.parent.parent.parent.get_node_direction()
+                # if we turn right, then we should add 1 to the index
+                
+                parent_route_direction = self.parent.route_direction
+                if int(self.get_node_direction())%6 > int(self.parent.get_node_direction())%6:
+                    return (parent_route_direction + 1) % 12
+                else:
+                    return (parent_route_direction + 11) % 12
+
+            if node_direction == grandparent_direction:
+                return parent.route_direction
                     
-                    if parent_direction == g_grandparent_direction:
-                        # If this is also a zig pattern, then we are for sure on a zig zag path, and the angle of this path is the average of the 
-                        # action angle from node to parent, or from grandparent to great grandparent
 
-                        node_dir_idx = node_direction_idx_dict[self.get_node_direction()]
-                        parent_dir_idx = node_direction_idx_dict[self.parent.get_node_direction()]
+                # # If a great grandparent exists, store it's direction
+                # if self.parent.parent.parent is not None: 
+                #     g_grandparent_direction = self.parent.parent.parent.get_node_direction()
+                    
+                #     if parent_direction == g_grandparent_direction:
+                #         # If this is also a zig pattern, then we are for sure on a zig zag path, and the angle of this path is the average of the 
+                #         # action angle from node to parent, or from grandparent to great grandparent
 
-                        # Before returning, we didn't have enough information when we were evaluating parent
-                        #   to determine if parent is part of a zigzag path
-                        # Now that we do, make sure to update parent also to this new value
-                        zigzag_dir = (node_dir_idx + parent_dir_idx) // 2   
-                        self.parent.route_direction = zigzag_dir
+                #         node_dir_idx = node_direction_idx_dict[self.get_node_direction()]
+                #         parent_dir_idx = node_direction_idx_dict[self.parent.get_node_direction()]
 
-                        # finally return the route direction value for this actual node
-                        return zigzag_dir
+                #         # Before returning, we didn't have enough information when we were evaluating parent
+                #         #   to determine if parent is part of a zigzag path
+                #         # Now that we do, make sure to update parent also to this new value
+                #         zigzag_dir = (node_dir_idx + parent_dir_idx) // 2   
+                #         self.parent.route_direction = zigzag_dir
+
+                #         # finally return the route direction value for this actual node
+                #         return zigzag_dir
                         
             # The indeterminate case is when there is a turn, b
             return self.parent.route_direction
 
             
         def update_velocity(self, problem):
-            current_node = self.parent.parent
+            current_node = self
             while current_node.parent:
                 new_v = problem.calculate_velocity(current_node.state[problem.state_dict['velocity']][0], problem.d_max, sqrt(3) * problem.hex_size)
                 if new_v < current_node.parent.state[problem.state_dict['velocity']][0]:
@@ -346,22 +344,6 @@ class PathfindingProblem:
                 else:
                     break
             
-            # Update the parent's velocity
-            parent_copy = copy(self.parent)
-            v = parent_copy.parent.state[problem.state_dict['velocity']][0]        
-            new_v = problem.calculate_velocity(v, problem.a_max, sqrt(3) * problem.hex_size)
-            parent_copy.state = (
-                parent_copy.state[0],
-                (new_v, parent_copy.state[problem.state_dict['velocity']][1])
-            )
-            # Finally update this node
-            v = new_v
-            new_v = problem.calculate_velocity(v, problem.a_max, sqrt(3) * problem.hex_size)
-            self.state = (
-                self.state[0],
-                (new_v, self.state[problem.state_dict['velocity']][1])
-            )
-
         def is_turn(self):
             return self.parent is not None and self.state[self.problem.state_dict['velocity']][1] != self.parent.state[self.problem.state_dict['velocity']][1]
         def is_zigzag(self):
@@ -370,11 +352,6 @@ class PathfindingProblem:
         
         def __str__(self):
             return str(self.state)
-
-        def __lt__(self, other):
-            return f(self) < f(other)
-        def __gt__(self, other):
-            return f(self) > f(other)
     def __init__(self, initial_state_f, initial_state_b, hex_map, obstacle_map, goal_loc, hex_radius, hex_size, agent_size_r, acceleration_max, deceleration_max, lat_acceleration_max):
         # Defines the indices for the components of the state
         self.state_dict = {
@@ -440,7 +417,6 @@ class PathfindingProblem:
                 newloc = self.add_locations(newloc, direction)
                 locs.add(newloc)
         return locs
-    
     def hex_manhattan_distance_2(self, hex1, hex2):
         print("\nhex1: ", hex1, type(hex1), "\nhex2: ", hex2, type(hex2))
         q1, r1 = hex1
