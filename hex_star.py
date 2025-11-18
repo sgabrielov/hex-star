@@ -2,15 +2,20 @@ from math import sqrt, pi
 from queue import PriorityQueue
 from itertools import count
 from copy import copy
+from collections import defaultdict
+import numpy as np
+import pickle as pkl
 
 a_star_weight = 1
 counter = count()
 
 # Best first search algorithm
 # using g(n) + h(n) for f will make this an A* search
-def best_first_search(problem, f, h):
+def best_first_search(problem, f, h, max_solutions = 1):
     node = problem.root
     frontier = PriorityQueue(0)
+
+    solutions = []
 
     # Priority queue, elements input as tuple (priority, counter, value), using f(node) for priority
     # Counter is used as the tiebreaker between nodes when they have the same f value
@@ -22,8 +27,18 @@ def best_first_search(problem, f, h):
         # Pop from the front of the queue
         node = frontier.get(False)[2]
 
+        # Terminal condition
         if problem.is_goal(node.state):
-            return node
+            
+            # We do not observe any rewards until a solution is found
+            # Once the terminal state is reached, recursively apply rewards
+            problem.q_update(node)
+            
+            solutions.append(node)
+            
+            if len(solutions) >= max_solutions:
+                return solutions
+            
         for child in expand(problem, node, h):
             s = child.state
             if s not in reached or child.path_cost < reached[s].path_cost:
@@ -37,7 +52,9 @@ def expand(problem, node, h):
     for action in problem.actions(s):
         s_new = problem.result(s, action)
         cost = node.path_cost + problem.action_cost(s, action)
-        new_node = problem.Node(s_new, node, action, cost, problem)
+        new_node = problem.Node(s_new, node, action, cost, problem) # Expand a node to take an action
+
+        
         if problem.heuristic_consistent_flag:
             problem.heuristic_consistent_flag = check_h_consistency(problem, new_node, h)
         nodes.append(new_node)
@@ -50,6 +67,7 @@ def expand(problem, node, h):
     return nodes
 
 def time_to_goal(node):
+    
     problem = node.problem
     goal_loc = problem.goal_loc
     agent_loc = node.state[problem.state_dict['agent']]
@@ -59,8 +77,43 @@ def time_to_goal(node):
 
     return problem.get_travel_time(v, a, s)
 
+def q_key(node):
+    # Construct the q_values key
+    problem = node.problem
+    goal_loc = problem.goal_loc
+    agent_loc = node.state[problem.state_dict['agent']]
+    agent_v, agent_dir = node.state[problem.state_dict['velocity']]
+
+    # Exclude agent velocity because it's a continuous value
+    return (
+        agent_loc,
+        goal_loc,
+        agent_dir
+    )
+    
+
+def q_learning(node):
+
+    # Get the learned h value for this state
+    return node.problem.q_values[q_key(node)]
+
+# Because A* needs a decent heuristic to work quickly, 
+# H* will use the max of time_to_goal and q_learning 
+# For A* max(h1, h2) is consistent when both h1 and h2 are consistent 
+def combo_h(
+    node,
+    h1 = time_to_goal,
+    h2 = q_learning
+):
+    return max(h1(node), h2(node))
+
+    
+
+
 def check_h_consistency(problem, node, h):
-    heuristic_is_consistent = h(node.parent) <= problem.action_cost(node.parent.state, node.action) + h(node)
+    heuristic_is_consistent = True
+    if node.parent is not None:
+        heuristic_is_consistent = h(node.parent) <= problem.action_cost(node.parent.state, node.action) + h(node)
     if not heuristic_is_consistent:
                 hn = h(node)
                 hp = h(node.parent)
@@ -140,7 +193,25 @@ class PathfindingProblem:
         
         def __str__(self):
             return str(self.state)
-    def __init__(self, initial_state, hex_map, obstacle_map, goal_loc, hex_radius, hex_size, acceleration_max, deceleration_max, lat_acceleration_max):
+
+    #### HexStar problem constructor ####
+    def __init__(
+        self, 
+        initial_state,        # start location
+        hex_map,              # all locations within environment
+        obstacle_map,         # all obstacles within hex_map
+        goal_loc,             # goal location
+        hex_radius,           # radius of hex in meters
+        hex_size,             # render size of hex in pixels
+        agent_size_r,         # agent cannot go closer than this to obstacles
+        acceleration_max,     # agent max acceleration
+        deceleration_max,     # agent max braking
+        lat_acceleration_max, # agent max turning g-force
+        q_learning_rate,  
+        q_discount_factor,
+        q_values_filename = None,
+        q_values = None,
+    ):
         self.root = self.Node(initial_state, None, None, 0, self)
 
         self.hex_map = hex_map
@@ -151,11 +222,25 @@ class PathfindingProblem:
         self.a_max = acceleration_max
         self.d_max = deceleration_max
         self.ay_max = lat_acceleration_max
+        self.agent_size_r = agent_size_r
 
         # for benchmarking
         self.heuristic_consistent_flag = True
         self.num_expanded_states = 0
         self.num_generated_nodes = 0
+
+        ### Q-Learning ###
+        if q_values_filename is not None:
+            self.q_values = self.load_q(q_values_filename)
+        elif q_values is not None:
+            self.q_values = q_values
+        else:
+            self.q_values = defaultdict(float) # Holds 1 value for the predicted heuristic
+            
+
+        self.q_learning_rate = q_learning_rate 
+        self.q_discount_factor = q_discount_factor
+        self.training_error = []
 
         # Defines the indices for the components of the state
         self.state_dict = {
@@ -166,19 +251,95 @@ class PathfindingProblem:
         # Defines the directions to the immediate neighborhood and their angle relative to horizontal
         self.neighborhood_angles = {
             (1,0): 0,
-            (0,1): pi/3,
-            (-1,1): 2*pi/3,
-            (-1,0): pi,
-            (0,-1): 4*pi/3,
-            (1,-1): 5*pi/3   
+            (0,1): 1,
+            (-1,1): 2,
+            (-1,0): 3,
+            (0,-1): 4,
+            (1,-1): 5   
         }
+
+    ### Q-Learning ###
+    def q_update(self, node):
+
+        # Make sure this only executes for terminal nodes
+        if not self.is_goal(node.state):
+            return
+
+
+        # Solution cost is the path cost for the terminal node
+        # This is Q(S')
+        solution_cost = node.path_cost
+
+        # Trivially, the case when the agent is already at the goal should have a Q-value of zero
+        self.q_values[q_key(node)] = 0
+
+        current_node = node
+        while current_node.parent is not None:
+            
+            # Initialize the parent, this is the node which is having its 
+            # Q value updated
+            current_node_parent = current_node.parent
+            
+            # What is the Q value for the next action from the next state
+            # Q(S', A')
+            future_q_value = self.q_values[q_key(current_node)]  # Q value from the child
+
+            # Calculate the reward, which is the travel time from parent to child
+            reward = current_node.path_cost - current_node_parent.path_cost
+            
+            # What should the Q-value be? (Bellman equation)
+            # R + gQ(S', A')
+            target = reward + self.q_discount_factor * future_q_value
+
+            # How wrong was our current estimate?
+            # R + gQ(S', A') - Q(S, A)
+            temporal_difference = target - self.q_values[q_key(current_node_parent)]
+
+            # Update our estimate in the direction of the error
+            # Learning rate controls how big steps we take
+            # Q(S,A) <- Q(S,A) + a[R + gQ(S',A') - Q(S,A)]
+            self.q_values[q_key(current_node_parent)] = (
+                self.q_values[q_key(current_node_parent)] + self.q_learning_rate * temporal_difference
+            )
+            
+            # Track learning progress (useful for debugging)
+            self.training_error.append(temporal_difference)
+            
+            # Iterate
+            current_node = current_node_parent
+
+    def check_collision(self, state):
+        if self.agent_size_r == 0: return state in self.obstacle_map
+        # initialize at r=0 and node to check if the node itself is an obstacle
+        max_r = self.agent_size_r
+        r = 0
+        r_neighbors = {state}
+        while r_neighbors and r <= max_r: 
+            if r_neighbors & self.obstacle_map != set():
+                return True
+            r = r + 1
+            r_neighbors = self.get_neighbors_at_radius(state,r)
+        # if there are no neighbors at this r, then end the search because r is out of bounds for the map
+        return False
+
+    def get_neighbors_at_radius(self, center, radius):
+        directions = [(-1,1),(-1,0),(0,-1), (1,-1), (1,0)]
+        newloc = self.add_locations(center, tuple([a*radius for a in (1,0)]))
+        locs = set()
+        locs.add(newloc)
+        for direction in directions:
+            for i in range(radius):
+                newloc = self.add_locations(newloc, direction)
+                locs.add(newloc)
+        return locs
+        
     def hex_manhattan_distance(self, hex1, hex2):
         q1, r1 = hex1
         q2, r2 = hex2
 
         dq = abs(q1-q2)
         dr = abs(r1-r2)
-        ds = abs(-q1-q2-r1-r2)
+        ds = abs((q2 + r2) - (q1 + r1))
 
         return (dq+dr+ds)/2
 
@@ -208,26 +369,31 @@ class PathfindingProblem:
         # Get the current direction of the agent in state
         # Cast to an int so it can be used to index neighborhood_angles.keys()
         # Coincidently, the values of the 6 directions correspond to their indices when casted this way
-        current_angle = int(state[self.state_dict['velocity']][1])
-
-        # Find the index values of the immediate turns in the clockwise (cw) and counter clockwise (ccw) directions
-        ccw_turn_idx = current_angle + 1
-        cw_turn_idx  = current_angle - 1
-
-        # If these values are out of bounds, cycle to the front or back of the keys list
-        if ccw_turn_idx > 5: ccw_turn_idx = 0 
-        if cw_turn_idx  < 0: cw_turn_idx  = 5
-
-        # Find the 3 actions corresponding to the straight, cw, ccw movements
+        current_angle = state[self.state_dict['velocity']][1]
         permutations = list(self.neighborhood_angles.keys())
-        turns = [ccw_turn_idx, current_angle, cw_turn_idx]
-        actions = [permutations[t] for t in turns]
+        
+        if current_angle is None:
+            actions = permutations
+        else:
+            # Find the index values of the immediate turns in the clockwise (cw) and counter clockwise (ccw) directions
+            ccw_turn_idx = current_angle + 1
+            cw_turn_idx  = current_angle - 1
+    
+            # If these values are out of bounds, cycle to the front or back of the keys list
+            if ccw_turn_idx > 5: ccw_turn_idx = 0 
+            if cw_turn_idx  < 0: cw_turn_idx  = 5
+    
+            # Find the 3 actions corresponding to the straight, cw, ccw movements
+            turns = [ccw_turn_idx, current_angle, cw_turn_idx]
+            actions = [permutations[t] for t in turns]
+
 
         
 
         # Remove obstacles and out of bounds locations from the action list
         actions = [a for a in actions 
-                   if self.add_locations(a, state[self.state_dict['agent']]) not in self.obstacle_map
+                   # if self.add_locations(a, state[self.state_dict['agent']]) not in self.obstacle_map # New hex is not an obstacle
+                   if not self.check_collision(self.add_locations(a, state[self.state_dict['agent']]))
                    and self.hex_manhattan_distance(self.add_locations(a, state[self.state_dict['agent']]), (0,0)) <= self.hex_radius
                   ]
         
@@ -265,4 +431,12 @@ class PathfindingProblem:
     
     def get_benchmarks(self):
         return (self.heuristic_consistent_flag, self.num_expanded_states, self.num_generated_nodes)
+
+    def save_q(q_values, filename):
+        with open(filename, 'wb') as file:
+            pickle.dump(q_values, file)
+    
+    def load_q(filename):
+        with open(filename, 'rb') as file:
+            return pickle.load(file)
         
