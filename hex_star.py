@@ -11,7 +11,7 @@ counter = count()
 
 # Best first search algorithm
 # using g(n) + h(n) for f will make this an A* search
-def best_first_search(problem, f, h, max_solutions = 1):
+def best_first_search(problem, f, h, max_solutions = 1, get_frontier = False, check_consistency = True):
     node = problem.root
     frontier = PriorityQueue(0)
 
@@ -37,16 +37,21 @@ def best_first_search(problem, f, h, max_solutions = 1):
             solutions.append(node)
             
             if len(solutions) >= max_solutions:
-                return solutions
+                for f_cost, _, nonterminal_node in list(frontier.queue):
+                    problem.q_update(nonterminal_node)
+                if not get_frontier:
+                    return solutions
+                else:
+                    return (solutions, list(frontier.queue))
             
-        for child in expand(problem, node, h):
+        for child in expand(problem, node, h, check_consistency = check_consistency):
             s = child.state
             if s not in reached or child.path_cost < reached[s].path_cost:
                 reached[s] = child
                 frontier.put((f(child, h), -next(counter), child))
     return None
 
-def expand(problem, node, h):
+def expand(problem, node, h, check_consistency = True):
     s = node.state
     nodes = []
     for action in problem.actions(s):
@@ -55,7 +60,7 @@ def expand(problem, node, h):
         new_node = problem.Node(s_new, node, action, cost, problem) # Expand a node to take an action
 
         
-        if problem.heuristic_consistent_flag:
+        if problem.heuristic_consistent_flag and check_consistency:
             problem.heuristic_consistent_flag = check_h_consistency(problem, new_node, h)
         nodes.append(new_node)
 
@@ -78,7 +83,6 @@ def time_to_goal(node):
     return problem.get_travel_time(v, a, s)
 
 def q_key(node):
-    # Construct the q_values key
     problem = node.problem
     goal_loc = problem.goal_loc
     agent_loc = node.state[problem.state_dict['agent']]
@@ -210,7 +214,9 @@ class PathfindingProblem:
         q_learning_rate,  
         q_discount_factor,
         q_values_filename = None,
-        q_values = None,
+        q_values_counts = None,
+        update_nonterminals = False,
+        learning=False,
     ):
         self.root = self.Node(initial_state, None, None, 0, self)
 
@@ -229,13 +235,21 @@ class PathfindingProblem:
         self.num_expanded_states = 0
         self.num_generated_nodes = 0
 
+        # for q-learning benchmarking
+        self.training_error = []
+        self.episode_rewards = []
+    
+        self.update_nonterminals = update_nonterminals
+
+        self.q_values_filename = q_values_filename
+        self.learning = learning
         ### Q-Learning ###
-        if q_values_filename is not None:
-            self.q_values = self.load_q(q_values_filename)
-        elif q_values is not None:
-            self.q_values = q_values
+        if self.q_values_filename is not None:
+            self.q_values, self.q_tracker = self.load_q(self.q_values_filename)
+        elif q_values_counts is not None:
+            self.q_values, self.q_tracker = q_values_counts
         else:
-            self.q_values = defaultdict(float) # Holds 1 value for the predicted heuristic
+            self.reset_q()
             
 
         self.q_learning_rate = q_learning_rate 
@@ -258,22 +272,26 @@ class PathfindingProblem:
             (1,-1): 5   
         }
 
+    def update_initial_state(self, new_initial_state):
+        self.root = self.Node(new_initial_state, None, None, 0, self)
     ### Q-Learning ###
     def q_update(self, node):
-
-        # Make sure this only executes for terminal nodes
-        if not self.is_goal(node.state):
+        if not self.learning:
             return
-
-
-        # Solution cost is the path cost for the terminal node
-        # This is Q(S')
-        solution_cost = node.path_cost
-
-        # Trivially, the case when the agent is already at the goal should have a Q-value of zero
-        self.q_values[q_key(node)] = 0
-
+        if self.is_goal(node.state):
+            if not self.update_nonterminals:
+                return
+            # self.q_update_terminal(node)
+            solution_cost = node.path_cost
+            self.q_values[q_key(node)] = 0
+            
+        else:
+            solution_cost = f(node)
+            self.q_values[q_key(node)] = q_learning(node)
+        
+        
         current_node = node
+        
         while current_node.parent is not None:
             
             # Initialize the parent, this is the node which is having its 
@@ -286,6 +304,7 @@ class PathfindingProblem:
 
             # Calculate the reward, which is the travel time from parent to child
             reward = current_node.path_cost - current_node_parent.path_cost
+            self.episode_rewards.append(reward)
             
             # What should the Q-value be? (Bellman equation)
             # R + gQ(S', A')
@@ -294,6 +313,8 @@ class PathfindingProblem:
             # How wrong was our current estimate?
             # R + gQ(S', A') - Q(S, A)
             temporal_difference = target - self.q_values[q_key(current_node_parent)]
+            # Track learning progress (useful for debugging)
+            self.training_error.append(temporal_difference)
 
             # Update our estimate in the direction of the error
             # Learning rate controls how big steps we take
@@ -301,12 +322,19 @@ class PathfindingProblem:
             self.q_values[q_key(current_node_parent)] = (
                 self.q_values[q_key(current_node_parent)] + self.q_learning_rate * temporal_difference
             )
+
+            if q_key(current_node_parent) in self.q_tracker.keys():
+                self.q_tracker[q_key(current_node_parent)] += 1
+            else: 
+                self.q_tracker[q_key(current_node_parent)] = 1
             
             # Track learning progress (useful for debugging)
             self.training_error.append(temporal_difference)
             
             # Iterate
             current_node = current_node_parent
+        
+
 
     def check_collision(self, state):
         if self.agent_size_r == 0: return state in self.obstacle_map
@@ -432,11 +460,19 @@ class PathfindingProblem:
     def get_benchmarks(self):
         return (self.heuristic_consistent_flag, self.num_expanded_states, self.num_generated_nodes)
 
-    def save_q(q_values, filename):
+    def save_q(self, q_values, q_tracker, filename=None):
+        if filename is None:
+            filename = self.q_values_filename
         with open(filename, 'wb') as file:
-            pickle.dump(q_values, file)
+            pkl.dump((q_values, q_tracker), file)
     
-    def load_q(filename):
+    def load_q(self, filename=None):
+        if filename is None:
+            filename = self.q_values_filename
         with open(filename, 'rb') as file:
-            return pickle.load(file)
-        
+            return pkl.load(file)
+
+    def reset_q(self):
+        self.q_values = defaultdict(float) # Holds 1 value for the predicted heuristic
+        self.q_tracker = defaultdict(float)
+    

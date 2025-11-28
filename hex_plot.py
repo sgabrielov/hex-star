@@ -26,6 +26,28 @@ def pixel_to_flat_hex(point, radius):
     r = int((-1./3 * point[0]  +  math.sqrt(3)/3 * point[1]) / radius)
     return (q, r)
 
+def diverging_red_white_green(n):
+    """
+    n colors from red → white → green.
+    """
+    half = n // 2
+    
+    # red → white
+    r1 = np.linspace(1, 1, half)
+    g1 = np.linspace(0, 1, half)
+    b1 = np.linspace(0, 1, half)
+
+    # white → green
+    r2 = np.linspace(1, 0, n - half)
+    g2 = np.linspace(1, 1, n - half)
+    b2 = np.linspace(1, 0, n - half)
+
+    r = np.concatenate([r1, r2])
+    g = np.concatenate([g1, g2])
+    b = np.concatenate([b1, b2])
+
+    return list(zip(r, g, b))
+
 def plot_hex(loc, color, alphas, radius, fig, ax, orientation = "pointy", text_labels = False, highlight_hex = None):
 
     # "option": function which executes the option
@@ -73,7 +95,7 @@ def plot_hex_pointy_top(locations, colors, alphas, radius, fig, ax, text_labels,
             ax.text(x-label_offset, y-label_offset, str(s), ha='center', va='center', size=14, c="blue")
             # ax.text(x, y, f'({z})', ha='center', va='center', size=14, c="black")
 
-def plot_map(hexes, obstacles_locs, agent_start_loc, goal_loc, max_radius, hex_size, velocities=None):
+def plot_map(hexes, obstacles_locs, agent_start_loc, goal_loc, max_radius, hex_size, velocities=None, h_values=None):
     axis_range = math.ceil((1+max_radius) * hex_size * 1.86)
     axis_x_range = [-axis_range, axis_range]
     axis_y_range = [-axis_range, axis_range]
@@ -92,14 +114,12 @@ def plot_map(hexes, obstacles_locs, agent_start_loc, goal_loc, max_radius, hex_s
     colors[agent_idx] = "blue"
     colors[goal_idx] = "green"
 
-    alphas = [1]*len(hexes)
-
-    
+    alphas = [1]*len(hexes)    
     
     plot_hex(hexes, colors, alphas, hex_size, fig, ax, text_labels=False)    
 
 
-def plot_problem(problem, solution, plt_title=None):
+def plot_problem(problem, solution, h_values = None, plt_title=None):
 
     # Get the solution path from the problem, including velocities:
     current_node = solution    
@@ -141,6 +161,49 @@ def plot_problem(problem, solution, plt_title=None):
     
     
     plot_hex(problem.hex_map, colors, alphas_idx, problem.hex_size, fig, ax, text_labels=False)
+
+def plot_q_values(problem, q_values, q_tracker, plt_title=None, plt_counts=False, text_labels=False):
+
+    axis_range = math.ceil((1+problem.hex_radius) * problem.hex_size * 1.66)
+    axis_x_range = [-axis_range, axis_range]
+    axis_y_range = [-axis_range, axis_range]
+    
+    fig, ax = plt.subplots(1)
+    ax.set_aspect('equal')
+    ax.set_xlim(axis_x_range)
+    ax.set_ylim(axis_y_range)
+    ax.axis('off')
+    
+    if plt_title is not None: plt.title(plt_title)
+    
+    obstacle_idx = [1 if v in problem.obstacle_map else 0 for v in problem.hex_map]
+    agent_idx = problem.hex_map.index(problem.root.state[0])
+    goal_idx =  problem.hex_map.index(problem.goal_loc)
+    colors = ["black" if c else "white" for c in obstacle_idx]
+
+    q_avgs = {s:sum([q_values[(s, problem.goal_loc, d)] for d in list(range(6))])/6 # Average the 6 directional h values for each cell
+        for s in problem.hex_map} # for all hexes in the map
+    max_q = max(q_avgs.values())
+
+    q_counts = {s:sum([q_tracker[(s, problem.goal_loc, d)] for d in list(range(6))])/6
+                for s in problem.hex_map}
+    max_q_count = max(q_counts.values())
+    scale_size = 100
+    color_scale = diverging_red_white_green(scale_size)
+    if plt_counts:
+        colors = ["black" if v in problem.obstacle_map else color_scale[int((scale_size-1) * q_counts[v] / max_q_count)] for v in problem.hex_map]
+    else:
+        colors = ["black" if v in problem.obstacle_map else color_scale[-int((scale_size-1) * q_avgs[v] / max_q)-1] for v in problem.hex_map]
+    
+    # min_alpha = 0.05
+    # alphas_idx = [1 if v in problem.obstacle_map else  max(min_alpha, q_counts[v] / max_q_count) for v in problem.hex_map]
+    alphas_idx = [1 for v in problem.hex_map]
+
+    
+    
+    colors[agent_idx] = "blue"
+    colors[goal_idx] = "green"
+    plot_hex(problem.hex_map, colors, alphas_idx, problem.hex_size, fig, ax, text_labels=text_labels)
 
 def plot_benchmarks(depths, states, nodes=None):
 
