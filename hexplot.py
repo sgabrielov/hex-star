@@ -42,6 +42,7 @@ def axial_ring(center: HexCoord, radius: int) -> Iterable[HexCoord]:
 def plot_hex_grid(
     obstacles: Iterable[HexCoord],
     start: HexCoord,
+    center: HexCoord,
     radius: int,
     hex_size: float = 1.0,
     goal: Optional[HexCoord] = None,
@@ -75,6 +76,8 @@ def plot_hex_grid(
     obstacles : Iterable[HexCoord]
         Set/list of blocked axial cells.
     start : HexCoord
+        Start location for the Hex Star agent
+    center : HexCoord
         Center of the plotted disk.
     radius : int
         Plot radius in hex steps around 'start'.
@@ -99,14 +102,24 @@ def plot_hex_grid(
     show_axis_legend : bool
         Add a legend indicating axis colors.
     """
-    obstacle_set: Set[HexCoord] = set(obstacles) if obstacles is not None else set()
+
+    # Materialize iterables (protect against exhausted generators)
+    obstacle_list: List[HexCoord] = list(obstacles) if obstacles is not None else []
+    obstacle_set: Set[HexCoord] = set(obstacle_list)
     path_set: Set[HexCoord] = set(path) if path is not None else set()
-    cells: List[HexCoord] = list(axial_ring(start, radius))
+
+    cells: List[HexCoord] = list(axial_ring(center, radius))
+
+
 
     created_fig = False
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
         created_fig = True
+    else:
+        # Important when reusing the same axes:
+        ax.cla()
+
 
     # Draw each cell
     for cell in cells:
@@ -185,7 +198,7 @@ def plot_hex_grid(
     ax.set_yticks([])
     ax.set_xlabel("x", color="#333333")
     ax.set_ylabel("y", color="#333333")
-    ax.set_title(f"Hex grid (radius={radius}) centered at start=({start.q},{start.r})")
+    ax.set_title(f"Hex grid (radius={radius}) centered at center=({center.q},{center.r})")
 
     # ---- Corner-anchored axis arrows ----
     if draw_axes:
