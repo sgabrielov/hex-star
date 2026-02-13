@@ -20,7 +20,7 @@ class HStarProblem:
         a_max: float,  # maximum acceleration (for acceleration phase)
         a_min: float,  # maximum deceleration (positive value; used with sign as needed)
         start_v: VelocityState = VelocityState(0, None),   # Start velocity
-        goal_v: VelocityState = VelocityState(None, None), # Target goal velocity for BiH*
+        goal_v: VelocityState = VelocityState(0, None), # Target goal velocity for BiH*
         ay_window_ms: int = 1000,  # window for lateral acceleration averaging
         collision_radius: int = 0, # How far away an obstacle must be from the agent's location to cause a collision
         search_direction: str = "forward",
@@ -33,7 +33,7 @@ class HStarProblem:
         self.ay_window_ms = ay_window_ms
         self.collision_radius = collision_radius
         self.start_v = start_v
-        self.goal_v = goal_v
+        #self.goal_v = goal_v
         self.search_direction = search_direction
 
 
@@ -129,12 +129,19 @@ class HStarProblem:
     
         diff = (i_out - i_in) % 6
         return (1.5 * self.grid.hex_size) if diff in (1, 5) else d_normal
+      
 
 
-    # 
+    # Calculates the resulting node from applying action to node
+    # Action is a hexcoord location returned by the actions function
+    # Representing the destination location
     def result(self, node: "Node", action: "HexCoord") -> "Node":
+        
         curr = node.location
         nxt  = action
+
+        # The actions function does a collision check, but just in case, if the next location is invalid
+        # return the node
         if not self.collision_clear(nxt):
             return node
     
@@ -142,41 +149,49 @@ class HStarProblem:
         v_here = float(node.velocity.magnitude or 0.0)
     
         out_dir_idx = get_direction(curr, nxt)
-    
-        # Provisional kinematics
+        
         if self.search_direction == "reverse":
-            v_next_prov = prev_velocity_straight(v_child=v_here, a_max=self.a_max, delta_d=s_eff)
-            # Edge time will use upstream entry speed in reverse later
+            # Force negative direction for reverse propagation
+            v_next_prov = prev_velocity_straight(
+                v_child=v_here, a_max=self.a_max, delta_d=s_eff, sign_ref=-1.0
+            )
         else:
-            v_next_prov = next_velocity_straight(v_parent=v_here, a_max=self.a_max, delta_d=s_eff)
+            v_next_prov = next_velocity_straight(
+                v_parent=v_here, a_max=self.a_max, delta_d=s_eff
+            )
     
         # --- INSERT turning-radius enforcement here ---
-        v_parent_adj, v_child_adj = _enforce_turning_backtrack(
-            self, node, out_dir_idx, s_eff, v_here, v_next_prov
-        )
-    
-        # Use adjusted speeds for edge time
-        if self.search_direction == "reverse":
-            t_step = travel_time(u=v_child_adj, a=self.a_max, s=s_eff)  # reverse uses downstream in your code
-            v_next = v_child_adj
-        else:
-            t_step = travel_time(u=v_parent_adj, a=self.a_max, s=s_eff)
-            v_next = v_child_adj
-    
+        #v_parent_adj, v_child_adj = _enforce_turning_backtrack(
+        #    self, node, out_dir_idx, s_eff, v_here, v_next_prov
+        #)
+
+        # Ignore turning radius adjustments
+        v_parent_adj, v_child_adj = v_here, v_next_prov
+        
+        # # Use adjusted speeds for edge time
+        # if self.search_direction == "reverse":
+        #     t_step = travel_time(u=v_child_adj, a=self.a_max, s=s_eff)  # reverse uses downstream in your code
+        #     v_next = v_child_adj
+        # else:
+        #     t_step = travel_time(u=v_parent_adj, a=self.a_max, s=s_eff)
+        #     v_next = v_child_adj
+
+        t_step = travel_time_symmetric(v_parent_adj, v_child_adj, s_eff)
+        v_next = v_child_adj
+
         child = Node(
             location=nxt,
             velocity=VelocityState(magnitude=v_next, direction=out_dir_idx),
             parent=node
         )
+        #child.calculate_turning_radius()
+        #child.get_v_max()
+        #child.backtrack()
         child.g_cost = node.g_cost + t_step
         child.h_cost = self.heuristic(self, child) if hasattr(self, "heuristic") and callable(self.heuristic) else h_cost_travel_time(self, child)
         child.f_cost = f_cost(child.g_cost, child.h_cost)
         return child
     
-        
-    
-
-
 
 
     def action_cost(self, prev: Node, action: HexCoord) -> float:
@@ -214,8 +229,8 @@ class HStarProblem:
             treat the start heading as unknown (allowed to expand all 6).
         """
         # Seed reversed start with the known goal velocity (magnitude; heading optional)
-        rev_start_v = VelocityState(magnitude=max(0.0, float(goal_speed_mag)),
-                                    direction=goal_heading_idx if goal_heading_idx is not None else None)
+        rev_start_v = VelocityState(magnitude=-float(self.start_v.magnitude),
+                                    direction=None)
 
         # Mirror problem geometry & limits; keep a_max/a_min positive
         reversed_problem = HStarProblem(
@@ -223,10 +238,10 @@ class HStarProblem:
             start=self.goal,     # swap endpoints
             goal=self.start,
             a_max=self.a_max,    # keep positive magnitudes (do NOT negate)
-            a_min=self.a_min,
+            a_min=self.a_max,
             start_v=rev_start_v, # start speed at reversed start
-            goal_v=self.start_v, # target end-state matches original start
-            ay_window_ms=self.ay_window_ms,
+            #goal_v=self.start_v, # target end-state matches original start
+            # ay_window_ms=self.ay_window_ms,
             collision_radius=self.collision_radius,
             search_direction="reverse",
 
@@ -240,7 +255,107 @@ class HStarProblem:
         # keep using the same code paths in result()/action_cost().
         return reversed_problem
 
+    def backtrack(
+        self,
+        start_node: Node,
+        v_max: float,
+        a_min: float
+    ):
+        """
+        Enforce a v_max on a path by forcing a node value to v_max,
+        and increasing by a_min along its ancestors, effectively braking
+        along the path until v_max is reached
+    
+        Parameters
+        ----------
+        start_node: Node
+            The start node of the backtrack to set velocity to v_max
+        v_max: float,
+            Target velocity to slow down to
+        a_min: float
+            Step size of velocity adjustments, braking capability
+        """ 
+        if start_node.velocity.magnitude <= v_max:
+            return
+
+        start_node.velocity = VelocityState(magnitude = v_max,
+                                            direction = start_node.velocity.direction)
+
+        current_node = start_node
+
+        while current_node.parent is not None:
+            parent_node = current_node.parent
+            child_v = current_node.velocity.magnitude
             
+            # Calculate delta_d using _effective_step_distance
+            delta_d = self._effective_step_distance(
+                parent_node, 
+                parent_node.location, 
+                current_node.location
+            )
+            
+            # Calculate maximum parent velocity that can decelerate to child_v
+            # Using: v_child^2 = v_parent^2 - 2*a_min*delta_d
+            # So: v_parent_max = sqrt(v_child^2 + 2*a_min*delta_d)
+            v_parent_max_squared = child_v * child_v + 2.0 * a_min * delta_d
+            v_parent_max = math.sqrt(v_parent_max_squared) if v_parent_max_squared >= 0.0 else 0.0
+            
+            # Check if parent velocity is acceptable AND within deceleration tolerance
+            decel_required = parent_node.velocity.magnitude - v_parent_max
+            if parent_node.velocity.magnitude <= v_parent_max + 1e-9 and decel_required <= a_min + 1e-9:
+                break
+            
+            # Clamp parent velocity
+            parent_node.velocity = VelocityState(
+                magnitude=v_parent_max,
+                direction=parent_node.velocity.direction
+            )
+            
+            # Move to next parent
+            current_node = parent_node
+
+    # def backtrack(
+    #     self,
+    #     start_node: Node,
+    #     v_max: float,
+    #     a_min: float
+    # ):
+    #     """
+    #     Enforce a v_max on a path by forcing a node value to v_max,
+    #     and increasing by a_min along its ancestors, effectively braking
+    #     along the path until v_max is reached
+    
+    #     Parameters
+    #     ----------
+    #     start_node: Node
+    #         The start node of the backtrack to set velocity to v_max
+    #     v_max: float,
+    #         Target velocity to slow down to
+    #     a_min: float
+    #         Step size of velocity adjustments, braking capability
+    #     """  
+    #     if start_node.velocity.magnitude <= v_max:
+    #         return
+
+    #     start_node.velocity = VelocityState(magnitude = v_max,
+    #                                         direction = start_node.velocity.direction)
+        
+    #     current_node = start_node
+    #     current_v = current_node.velocity.magnitude
+
+    #     next_node = current_node.parent
+    #     next_v = next_node.velocity.magnitude
+        
+    #     while current_v + a_min <= next_v:
+    #         current_node.velocity = VelocityState(magnitude = current_v + a_min,
+    #                                               direction = current_node.velocity.direction)
+
+    #         current_node = current_node.parent
+    #         current_v = current_node.velocity.magnitude
+    
+    #         next_node = current_node.parent
+    #         next_v = next_node.velocity.magnitude
+
 
 
 
@@ -436,22 +551,47 @@ def _enforce_turning_backtrack(
 # ------------------------------
 
 
+def next_velocity_straight(
+    v_parent: float, a_max: float, delta_d: float, sign_ref: float | None = None
+) -> float:
+    rad = v_parent*v_parent + 2.0*a_max*delta_d
+    v_mag = math.sqrt(rad) if rad >= 0.0 else 0.0
+    # choose sign: explicit if provided, else keep v_parent, else fall back to a_max
+    sref = sign_ref
+    if sref is None:
+        sref = v_parent if v_parent != 0.0 else (a_max if a_max != 0.0 else +1.0)
+    return math.copysign(v_mag, sref)
 
+def prev_velocity_straight(
+    v_child: float, a_max: float, delta_d: float, sign_ref: float | None = None
+) -> float:
+    rad = v_child*v_child + 2.0*a_max*delta_d
+    v_mag = math.sqrt(rad) if rad >= 0.0 else 0.0
+    sref = sign_ref
+    if sref is None:
+        sref = v_child if v_child != 0.0 else (a_max if a_max != 0.0 else +1.0)
+    return math.copysign(v_mag, sref)
 
 # helpers: put these once (if not already defined with these exact formulas)
-def next_velocity_straight(v_parent: float, a_max: float, delta_d: float) -> float:
-    return math.sqrt(max(v_parent*v_parent + 2.0*a_max*delta_d, 0.0))  # Eq.(7)
+def next_velocity_straight_old(v_parent: float, a_max: float, delta_d: float) -> float:
+    return math.sqrt(v_parent*v_parent + 2.0*a_max*delta_d)  # Eq.(7)
 
-def prev_velocity_straight(v_child: float, a_max: float, delta_d: float) -> float:
-    return math.sqrt(max(v_child*v_child - 2.0*a_max*delta_d, 0.0))     # inverse of Eq.(7)
+def prev_velocity_straight_old(v_child: float, a_max: float, delta_d: float) -> float:
+    return math.sqrt(v_child*v_child - 2.0*a_max*delta_d)     # inverse of Eq.(7)
 
 def travel_time(u: float, a: float, s: float) -> float:
     # t = (-u + sqrt(u^2 + 2 a s)) / a   (note **2 a s**, not 4 a s)
     if a == 0: raise ValueError("Acceleration cannot be zero")
     disc = u*u + 2.0*a*s
     if disc < 0: return math.inf
-    return (-u + math.sqrt(disc)) / a
+    return (-abs(u) + math.sqrt(disc)) / a # Take the absolute value of velocity in case its negative
 
+
+def travel_time_symmetric(v1: float, v2: float, s: float) -> float:
+    denom = abs(v1) + abs(v2)
+    if denom == 0:
+        return math.inf
+    return 2.0 * s / denom
 
 
 
@@ -562,7 +702,7 @@ class HStarSearch:
             node = self.open_set.get(False)[2]
     
             if self.problem.is_goal(node.location):
-                return node
+                return node # problem.backtrack(node, 0, problem.a_min)
             for child in self.expand(node):
                 s = child.location
                 if s not in self.closed_set or child.g_cost < self.closed_set[s].g_cost:

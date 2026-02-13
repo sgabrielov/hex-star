@@ -52,8 +52,8 @@ def plot_hex_grid(
     # ---- Labels & colors ----
     show_coords: bool = False,
     label_two_lines: bool = True,
-    q_color: str = "#2d6cdf",   # q-axis blue
-    r_color: str = "#e67e22",   # r-axis orange
+    q_color: str = "#2d6cdf",
+    r_color: str = "#e67e22",
     facecolor_free: str = "#f2f6ff",
     facecolor_obstacle: str = "#444444",
     facecolor_start: str = "#2d6cdf",
@@ -63,9 +63,13 @@ def plot_hex_grid(
     linewidth: float = 0.8,
     # ---- Axis arrows & legend ----
     draw_axes: bool = True,
-    axis_corner: str = "lower left",   # "upper right" | "upper left" | "lower left" | "lower right"
+    axis_corner: str = "lower left",
     show_axis_legend: bool = True,
+    plt_title: str = "",
+    # ---- Saving ----
+    save_path: Optional[str] = None,
 ) -> plt.Axes:
+
     """
     Plot a pointy-top hex grid around 'start' with given 'radius'.
     - Corner-anchored colored axis arrows (q, r).
@@ -198,7 +202,7 @@ def plot_hex_grid(
     ax.set_yticks([])
     ax.set_xlabel("x", color="#333333")
     ax.set_ylabel("y", color="#333333")
-    ax.set_title(f"Hex grid (radius={radius}) centered at center=({center.q},{center.r})")
+    ax.set_title(f"Hex grid (radius={radius}) centered at center=({center.q},{center.r}) {plt_title}")
 
     # ---- Corner-anchored axis arrows ----
     if draw_axes:
@@ -284,5 +288,12 @@ def plot_hex_grid(
 
     if created_fig:
         plt.tight_layout()
+
+    # ---- Optional save ----
+    if save_path is not None:
+        # If we created the figure, save that; otherwise save the parent figure
+        fig = ax.figure
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+
 
     return ax
