@@ -8,12 +8,13 @@ from collections import defaultdict
 import math
 
 from dataclasses import dataclass
+import time
+import heapq
 
 @dataclass(frozen=True)
 class DirectionInfo:
     s: int # distance from origin
     blockers: List[HexCoord] # HexCoords that must be open for this hex to be navigable
-
 
 DEFAULT_EPSILON = 1e-9
 class HStarProblem:
@@ -37,7 +38,6 @@ class HStarProblem:
         collision_radius: int = 0, # How far away an obstacle must be from the agent's location to cause a collision
         jps_horizon: int = 5, # Max jumps in a row when shortcutting
         n_step: int = 2, # number of steps to take in one action | radial resolution
-        search_direction: str = "forward",
         epsilon: float = DEFAULT_EPSILON # 1e-14
     ) -> None:
         self.grid = grid
@@ -50,18 +50,16 @@ class HStarProblem:
         self.jps_horizon = jps_horizon
         self.start_v = start_v
         self.goal_v = goal_v
-        self.search_direction = search_direction
         self.n_step = n_step
         self.epsilon = epsilon
 
+        self.heuristic_consistent_flag = True
 
-        # if self.search_direction == "forward":
-        #     self.transition_function = next_velocity
-        # elif self.search_direction == "reverse":
-        #     self.transition_function = prev_velocity
+
+
+        self.transition_function = next_velocity
+        self.backtrack_transition_function = prev_velocity
         
-        self.transition_function = next_velocity
-        self.transition_function = next_velocity
 
         self.DIRECTIONS = unique_direction_vectors_up_to_n(HexCoord(0,0), self.n_step)
         self.DIRECTIONS_INFO = {}
@@ -81,7 +79,7 @@ class HStarProblem:
             return node
         if self.goal_v.magnitude is None:
             return node
-        return self.backtrack(node, self.goal_v.magnitude, self.a_min, transition_function = self.transition_function)
+        return self.backtrack(node, self.goal_v.magnitude, -self.a_min, transition_function = self.backtrack_transition_function)
     
     def is_goal_loc(self, location: HexCoord) -> bool:
         """Return True when the agent is exactly at the goal hex."""
@@ -207,34 +205,74 @@ class HStarProblem:
         d_step = hex_step_distance(self.grid.hex_size)
         u = prev.velocity.magnitude
         a = self.a_max
-        return travel_time(u, a, d_step)   
+        return travel_time(u, a, d_step)          
 
-    # def action_cost(self, prev: Node, action: HexCoord) -> float:
-    #     """
-    #     Travel time from `prev` to `action` (a neighbor location), using:
-    #         s = √3 * hex_size
-    #         t = (-u + sqrt(u^2 + 2*a*s)) / a
-    #     Note: this uses the parent's speed `u` and problem's `a_max` (acceleration phase).
-    #     """
-        
-    #     action_step, g = gcd_reduce(add_coords(action, (-node.location.q, -node.location.r)))
-    #     direction = self.DIRECTIONS.index(action_step)
-    #     s = self.DIRECTIONS_INFO[action_step].s * g
-    #     new_v = self.transition_function(parent.velocity.magnitude, self.a_max, s)
-        
-    #     return travel_time_accel_limited(node.velocity.magnitude, new_v, s, self.a_max, self.a_min)
-        
-    def constrain_velocity(self, node, next_location):
+    def constrain_velocity(
+        self,
+        node: Node,
+        next_location: Optional[HexCoord] = None,
+        forced_v_max: Optional[float] = None,
+    ):
+        """
+        If forced_v_max is provided, enforce that cap directly by backtracking.
+        Otherwise compute a turn-based cap from (node.parent, node, next_location).
+        """
         if node.parent is None:
             return None
-        radius = self.calculate_turning_radius(node, next_location)
-        if radius is None:
-            return None
-        v_max = math.sqrt(2*radius*self.ay_window_ms)
+    
+        if forced_v_max is not None:
+            v_max = forced_v_max
+        else:
+            if next_location is None:
+                return None
+            radius = self.calculate_turning_radius(node, next_location)
+            if radius is None:
+                return None
+            v_max = math.sqrt(2 * radius * self.ay_window_ms)
+    
         if node.velocity.magnitude <= v_max + self.epsilon:
-            return None # Do nothing
-        return self.backtrack(node, v_max, self.a_min, transition_function = self.transition_function)
-        
+            return None  # already valid, no repair needed
+    
+        return self.backtrack(
+            node,
+            v_max,
+            -self.a_min,
+            transition_function=self.backtrack_transition_function,
+        )
+    def reverse_dir_idx(self, dir_idx: Optional[int]) -> Optional[int]:
+        """
+        Return the index in self.DIRECTIONS corresponding to the opposite
+        of self.DIRECTIONS[dir_idx].
+    
+        Works for the expanded direction basis produced from
+        unique_direction_vectors_up_to_n(...), not just the 6 immediate
+        neighbor directions.
+    
+        Examples:
+            self.DIRECTIONS[0] = HexCoord(1, 0)   -> returns index of HexCoord(-1, 0)
+            self.DIRECTIONS[7] = HexCoord(-2, 1)  -> returns index of HexCoord(2, -1)
+        """
+        if dir_idx is None:
+            return None
+    
+        if dir_idx < 0 or dir_idx >= len(self.DIRECTIONS):
+            raise IndexError(
+                f"Direction index out of range: {dir_idx} "
+                f"(valid range: 0..{len(self.DIRECTIONS)-1})"
+            )
+    
+        vec = self.DIRECTIONS[dir_idx]
+        opposite_vec = HexCoord(-vec.q, -vec.r)
+    
+        try:
+            return self.DIRECTIONS.index(opposite_vec)
+        except ValueError:
+            raise ValueError(
+                f"Opposite direction {opposite_vec} for index {dir_idx} "
+                f"(vector {vec}) not found in self.DIRECTIONS. "
+                "Check that self.DIRECTIONS is symmetric under negation."
+            )
+         
     def reverse(
         self,
         goal_speed_mag: Optional[float] = None,
@@ -263,7 +301,7 @@ class HStarProblem:
             goal_speed_mag = self.goal_v.magnitude
 
         if goal_heading_idx is None:
-            goal_heading_idx = reverse_dir(self.goal_v.direction)
+            goal_heading_idx = self.reverse_dir_idx(self.goal_v.direction)
             
         rev_start_v = VelocityState(magnitude=goal_speed_mag,
                                     direction=goal_heading_idx
@@ -275,8 +313,8 @@ class HStarProblem:
             grid=self.grid,
             start=self.goal,     # swap endpoints
             goal=self.start,
-            a_max=self.a_min,    # keep positive magnitudes 
-            a_min=self.a_max,
+            a_max=-self.a_min,    # keep positive magnitudes 
+            a_min=-self.a_max,
             start_v=rev_start_v, # start speed at reversed start
             goal_v=self.start_v, # target end-state matches original start
             ay_window_ms=self.ay_window_ms,
@@ -354,6 +392,8 @@ class HStarProblem:
     def calculate_turning_radius(self, node, child_location):
         if node.parent is None:
             return None
+        if node.velocity.direction is None:
+            return 1
         parent = node.parent
         angle = angle_abc(parent.location, node.location, child_location)
 
@@ -412,6 +452,14 @@ class HStarProblem:
                 break
     
         return out
+
+    def reverse_dir_idx(self, dir_idx):
+        if dir_idx is None:
+            return None
+        dir_vect = self.DIRECTIONS[dir_idx]
+        reverse_dir_vect = reverse_dir(dir_vect)
+        reverse_dir_idx = self.DIRECTIONS.index(reverse_dir_vect)
+        return reverse_dir_idx
 # ------------------------------
 # Geometry & kinematics utilities
 # ------------------------------
@@ -549,6 +597,8 @@ def radius_from_angle(edge_length, angle, inscribed=False, degrees_in: bool = Fa
         return edge_length / (2 * math.sin(math.pi / n))
 
 def construct_full_solution(solution):
+    if solution is None:
+        return None
     fsolution_path = []
     for node in solution:
         if node.parent:
@@ -679,19 +729,6 @@ def g_cost(problem: HStarProblem, node: Node) -> float:
     Uses velocity at parent and hex step distance.
     """
     return node.g_cost
-
-# def h_cost_travel_time(problem: HStarProblem, node: Node) -> float:
-#     """
-#     Heuristic: estimated time from node to goal assuming highest safe velocity
-#     and straight-line (manhattan) hex distance.
-#     """
-#     steps = hex_manhattan_distance(node.location, problem.goal)
-#     distance = steps * hex_step_distance(problem.grid.hex_size)
-#     a = problem.a_max
-#     a2 = problem.a_min
-#     u = node.velocity.magnitude
-#     goal_v = problem.goal_v.magnitude
-#     return travel_time_accel_limited(u, goal_v, distance, a, a2)
     
 def h_cost_travel_time(problem: HStarProblem, node: Node) -> float:
     """
@@ -700,7 +737,7 @@ def h_cost_travel_time(problem: HStarProblem, node: Node) -> float:
     """
     steps = hex_manhattan_distance(node.location, problem.goal)
     distance = steps * hex_step_distance(problem.grid.hex_size)
-    a = problem.a_max
+    a = abs(problem.a_max)
     u = node.velocity.magnitude
     return travel_time(u,a,distance)
     
@@ -717,23 +754,35 @@ def f_cost(g: float, h: float) -> float:
 # --- Heuristic type alias ---
 HeuristicFn = Callable[["HStarProblem", "Node"], float]
 
-import time
 class HStarSearch:
     """
     A* framework specialized with H* time-based costs and hex-grid actions.
+
+    Benchmarking style aligned with BidHStarSearch:
+      - enable_benchmarking toggle
+      - centralized _bench helper
+      - optional progress snapshots
+      - top-k frontier summaries
     """
-    
+
     def __init__(
-        self, 
-        problem: HStarProblem, 
+        self,
+        problem: HStarProblem,
         heuristic: Optional[HeuristicFn] = h_cost_travel_time,
+        enable_benchmarking: bool = True,
+        progress_every: Optional[int] = None,
+        progress_top_k: int = 5,
     ) -> None:
         self.problem = problem
         self.h: HeuristicFn = heuristic
-       
+
         self.open_set = PriorityQueue()
-        self.closed_set: Dict[HexCoord] = {}
+        self.closed_set: Dict[HexCoord, Node] = {}
         self._counter = count()
+
+        self.enable_benchmarking = enable_benchmarking
+        self.progress_every = progress_every
+        self.progress_top_k = progress_top_k
 
         self.benchmarks = {
             "states_reached": 0,
@@ -743,10 +792,87 @@ class HStarSearch:
             "solution_length": 0,
             "open_set_sizes": [],
             "closed_set_sizes": [],
+            "iterations": 0,
+            "goal_found": False,
+            "progress_snapshots": [],
         }
-        
+
         self.initialize()
 
+    # ------------------------------------------------------------------
+    # Benchmark helpers
+    # ------------------------------------------------------------------
+
+    def _bench(self, key: str, value=1):
+        if not self.enable_benchmarking:
+            return
+
+        current = self.benchmarks.get(key)
+
+        if isinstance(value, (int, float)) and isinstance(current, (int, float)):
+            self.benchmarks[key] += value
+        else:
+            self.benchmarks[key] = value
+
+    def _node_summary(self, node: Node) -> dict:
+        return {
+            "node": node,   # keep original reference so snapshot_with_paths can reconstruct later
+            "location": (node.location.q, node.location.r),
+            "g": node.g_cost,
+            "h": node.h_cost,
+            "f": node.f_cost,
+            "dir": node.velocity.direction,
+            "v": node.velocity.magnitude,
+        }
+
+    def _frontier_top_k(self, k: int) -> List[dict]:
+        if self.open_set.empty():
+            return []
+
+        top_items = heapq.nsmallest(k, self.open_set.queue)
+        return [self._node_summary(node) for _, _, node in top_items]
+
+    def _record_progress_snapshot(self):
+        if not self.enable_benchmarking:
+            return
+
+        if self.progress_every is None:
+            return
+
+        iteration = self.benchmarks["iterations"]
+        if iteration % self.progress_every != 0:
+            return
+
+        snapshot = {
+            "iteration": iteration,
+            "open_size": self.open_set.qsize(),
+            "closed_size": len(self.closed_set),
+            "top": self._frontier_top_k(self.progress_top_k),
+        }
+
+        self.benchmarks["progress_snapshots"].append(snapshot)
+
+    def snapshot_with_paths(self, snapshot: dict) -> dict:
+        """
+        Takes one progress snapshot and returns a new snapshot where
+        top entries also include reconstruct_path(node).
+        """
+        out = dict(snapshot)
+
+        processed = []
+        for entry in snapshot.get("top", []):
+            node = entry["node"]
+            processed.append({
+                **entry,
+                "path": self.reconstruct_path(node),
+            })
+
+        out["top"] = processed
+        return out
+
+    # ------------------------------------------------------------------
+    # Core setup
+    # ------------------------------------------------------------------
 
     def initialize(self) -> Node:
         self.root = Node(
@@ -757,19 +883,17 @@ class HStarSearch:
             h_cost=0.0,
             f_cost=0.0,
         )
-        # Seed costs
+
         self.root.h_cost = self.h(self.problem, self.root)
         self.root.f_cost = self.root.g_cost + self.root.h_cost
-        
+
         self.open_set.put((self.root.f_cost, -next(self._counter), self.root))
-        self.closed_set[self.root.location] = self.root
 
-        self.open_set_sizes = []
-        self.closed_set_sizes = []
-        
+        closed_set_key = self.root.location
+        # closed_set_key = (self.root.location, self.root.velocity.direction)
+        self.closed_set[closed_set_key] = self.root
+
         return self.root
-
-            
 
     def f(self, node):
         return node.g_cost + self.h(self.problem, node)
@@ -783,46 +907,106 @@ class HStarSearch:
         out.reverse()
         return out
 
+    # ------------------------------------------------------------------
+    # Search loop
+    # ------------------------------------------------------------------
+
     def search(self) -> Optional[List[Node]]:
-        start_time = time.time()
+        start_time = time.perf_counter()
+
         while not self.open_set.empty():
-            self.benchmarks['open_set_sizes'].append(self.open_set.qsize())
-            self.benchmarks['closed_set_sizes'].append(len(self.closed_set))
+            self._bench("iterations", 1)
+
+            if self.enable_benchmarking:
+                self.benchmarks["open_set_sizes"].append(self.open_set.qsize())
+                self.benchmarks["closed_set_sizes"].append(len(self.closed_set))
+                self._record_progress_snapshot()
+
             _, _, node = self.open_set.get(False)
-            self.benchmarks['nodes_expanded'] += 1
+            self._bench("nodes_expanded", 1)
+
             if self.problem.is_goal(node):
-                self.benchmarks['search_time'] = time.time() - start_time
+                self._bench("search_time", time.perf_counter() - start_time)
+
                 node = self.problem.enforce_goal_velocity(node)
+                if node is None:
+                    # Goal location reached but velocity enforcement made it infeasible
+                    return None
+
                 soln_path = self.reconstruct_path(node)
-                self.benchmarks['solution_cost'] = node.g_cost
-                self.benchmarks['solution_length'] = len(soln_path)
+
+                if self.enable_benchmarking:
+                    self.benchmarks["goal_found"] = True
+                    self.benchmarks["solution_cost"] = node.g_cost
+                    self.benchmarks["solution_length"] = len(soln_path)
+
                 return soln_path
+
             for child in self.expand(node):
                 s = child.location
+                # s = (child.location, child.velocity.direction)
+
                 prev_best = self.closed_set.get(s)
                 if prev_best is None or child.g_cost < prev_best.g_cost - 1e-12:
                     self.closed_set[s] = child
                     f = child.g_cost + self.h(self.problem, child)
                     self.open_set.put((f, -next(self._counter), child))
-        return None  
-    
+
+        self._bench("search_time", time.perf_counter() - start_time)
+        return None
+
+    # ------------------------------------------------------------------
+    # Expansion
+    # ------------------------------------------------------------------
 
     def expand(self, node):
         children = []
         for action in self.actions(node):
             child = self.result(node, action)
-            self.benchmarks["states_reached"] += 1
-            children.append(child)
-        return children
+            self._bench("states_reached", 1)
 
+            if self.problem.heuristic_consistent_flag:
+                self.problem.heuristic_consistent_flag = self.check_h_consistency(
+                    self.problem, node, self.h
+                )
+
+            children.append(child)
+
+        return children
 
     def actions(self, node):
         return self.problem.actions(node)
+
     def action_cost(self, node, action):
         return self.problem.action_cost(node, action)
+
     def result(self, node, action):
         return self.problem.result(node, action)
-        
+
+    def check_h_consistency(self, problem, node, h):
+        if node is None:
+            return True
+        if node.parent is None:
+            return True
+
+        heuristic_is_consistent = (
+            h(problem, node.parent) <= node.g_cost + h(problem, node) + problem.epsilon
+        )
+
+        if not heuristic_is_consistent:
+            hn = h(problem, node)
+            hp = h(problem, node.parent)
+            ac = node.g_cost
+            print("h is inconsistent")
+            print(f'ac:        {ac}')
+            print(f'h(parent): {hp}')
+            print(f'h(node):   {hn}')
+            print(f'{hp} <= {ac} + {hn}  is false')
+            print(node)
+            print(node.parent)
+
+        return heuristic_is_consistent
+
     def get_benchmarks(self):
         return self.benchmarks
 
@@ -842,3 +1026,4 @@ def velocity_stddev(path: List[Node]) -> Tuple[float, float]:
     Return (stddev_speed, stddev_heading_change) along the path.
     """
     pass
+
