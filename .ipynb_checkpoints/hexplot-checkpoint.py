@@ -1,6 +1,7 @@
 import math
 from typing import Iterable, Optional, Set, List, Tuple, Dict, Sequence
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from matplotlib.patches import RegularPolygon
 from matplotlib.lines import Line2D
 from matplotlib.collections import PolyCollection
@@ -12,7 +13,9 @@ from hexgeometry import hdist
 
 
 
-from hexgrid import HexCoord, make_grid_with_obstacles, hex_disk
+from hexgrid import HexCoord, make_grid_with_obstacles, hex_disk, hexes_in_between_solid
+from hexstar import construct_full_solution
+
 
 
 # If HexCoord is defined in your module, import it and remove this local definition.
@@ -386,9 +389,15 @@ def plot_hex_grid_2(
 
     if created_fig:
         plt.tight_layout()
-
+    
     if save_path is not None:
         ax.figure.savefig(save_path, dpi=300, bbox_inches="tight")
+    
+        if created_fig:
+            plt.close(ax.figure)
+    
+    return ax
+
 
     return ax
 def plot_hex_grid(
@@ -1017,3 +1026,162 @@ def plot_velocity_profile(
         plt.close(fig)
 
     return ax
+
+def snapshot_paths_hexcoord_set(snapshot, solid: bool = False):
+    coords = set()
+
+    for side in ("forward_top", "reverse_top"):
+        for entry in snapshot.get(side, []):
+            path = entry.get("path", [])
+
+            if not solid:
+                for node in path:
+                    coords.add(node.location)
+            else:
+                for node in path:
+                    if node.parent is not None:
+                        coords.update(hexes_in_between_solid(node.location, node.parent.location))
+                    coords.add(node.location)
+
+    return coords
+
+
+
+def animate_progress_dual_view_with_solution(
+    progress_snapshots,
+    snapshot_with_paths_fn,
+    solution,
+    obstacles,
+    start,
+    center,
+    radius,
+    goal=None,
+    solid_final=True,
+    figsize=(16, 9),
+    interval=300,
+    repeat=False,
+    show_coords=False,
+    linewidth=0,
+    title_prefix="Bidirectional Search Progress",
+    step=1,
+):
+    """
+    Animate progress snapshots in two side-by-side views:
+
+    Left panel:
+        Frontier node locations only (solid=False)
+
+    Right panel:
+        Full path / solid view (solid=True)
+
+    Final frame:
+        Both panels show the final solution.
+
+    Parameters
+    ----------
+    progress_snapshots : list[dict]
+        Benchmark progress snapshots.
+    snapshot_with_paths_fn : callable
+        Function that takes one snapshot and returns a processed snapshot
+        with reconstructed paths.
+    solution : list[Node]
+        Final stitched solution path.
+    obstacles : Iterable[HexCoord]
+    start : HexCoord
+    center : HexCoord
+    radius : int
+    goal : Optional[HexCoord]
+    solid_final : bool
+        If True, final solution is rendered as solid.
+        If False, final solution is rendered as node locations only.
+    figsize : tuple
+    interval : int
+    repeat : bool
+    show_coords : bool
+    linewidth : float
+    title_prefix : str
+    step : int
+        Use every `step`-th progress snapshot.
+    """
+    sampled = progress_snapshots[::step]
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=figsize)
+
+    # Precompute final solution once
+    if solid_final:
+        final_hc = set(construct_full_solution(solution))
+    else:
+        final_hc = {node.location for node in solution}
+
+    n_progress = len(sampled)
+
+    def update(i):
+        if i < n_progress:
+            snap = sampled[i]
+            processed = snapshot_with_paths_fn(snap)
+
+            # Left: locations only
+            hc_left = snapshot_paths_hexcoord_set(processed, solid=False)
+
+            # Right: full/solid path
+            hc_right = snapshot_paths_hexcoord_set(processed, solid=True)
+
+            iter_label = snap.get("iteration", i)
+
+            left_title = (
+                f"{title_prefix} | Frontier Nodes Only\n"
+                f"frame={i} | iteration={iter_label}"
+            )
+            right_title = (
+                f"{title_prefix} | Full Path View\n"
+                f"frame={i} | iteration={iter_label}"
+            )
+        else:
+            # Final frame: both show final solution
+            hc_left = final_hc
+            hc_right = final_hc
+
+            left_title = f"{title_prefix} | FINAL SOLUTION"
+            right_title = f"{title_prefix} | FINAL SOLUTION"
+
+        plot_hex_grid_2(
+            obstacles,
+            start,
+            center,
+            radius,
+            goal=goal,
+            figsize=figsize,
+            show_coords=show_coords,
+            path=hc_left,
+            linewidth=linewidth,
+            plt_title=left_title,
+            ax=ax_left,
+            save_path=None,
+        )
+
+        plot_hex_grid_2(
+            obstacles,
+            start,
+            center,
+            radius,
+            goal=goal,
+            figsize=figsize,
+            show_coords=show_coords,
+            path=hc_right,
+            linewidth=linewidth,
+            plt_title=right_title,
+            ax=ax_right,
+            save_path=None,
+        )
+
+        return ()
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=n_progress + 1,   # +1 for the final solution frame
+        interval=interval,
+        repeat=repeat,
+        blit=False,
+    )
+
+    return anim, fig, (ax_left, ax_right)

@@ -1163,8 +1163,275 @@ def gen_fill_all(
 # Register it
 register_obstacle_generator("fill_all", gen_fill_all)
 
+
 # -----------------------------------------------------------------------------
-# Generator #2: track  (Build a road from start to goal)
+# Generator: walls  (random straight wall segments in axial directions)
+# -----------------------------------------------------------------------------
+
+def _normalize_wall_frequency(wall_frequency) -> Dict[str, float]:
+    """
+    Normalize wall_frequency into relative weights for the 3 axial line families.
+
+    Accepted forms:
+        scalar:
+            1
+            2.5
+
+        tuple/list:
+            (q_weight, r_weight, s_weight)
+
+        dict:
+            {"q": q_weight, "r": r_weight, "s": s_weight}
+
+    Returns:
+        {"q": float, "r": float, "s": float}
+    """
+
+    if isinstance(wall_frequency, (int, float)):
+        return {
+            "q": float(wall_frequency),
+            "r": float(wall_frequency),
+            "s": float(wall_frequency),
+        }
+
+    if isinstance(wall_frequency, (tuple, list)):
+        if len(wall_frequency) != 3:
+            raise ValueError(
+                "wall_frequency tuple/list must have exactly 3 values: (q, r, s)"
+            )
+
+        return {
+            "q": float(wall_frequency[0]),
+            "r": float(wall_frequency[1]),
+            "s": float(wall_frequency[2]),
+        }
+
+    if isinstance(wall_frequency, dict):
+        return {
+            "q": float(wall_frequency.get("q", 0.0)),
+            "r": float(wall_frequency.get("r", 0.0)),
+            "s": float(wall_frequency.get("s", 0.0)),
+        }
+
+    raise TypeError(
+        "wall_frequency must be a scalar, a tuple/list of length 3, or a dict"
+    )
+
+
+def _sample_wall_length(
+    rng: random.Random,
+    avg_length: float,
+    min_length: int,
+    max_length: int,
+) -> int:
+    """
+    Sample a wall length centered around avg_length.
+
+    Uses a simple Gaussian distribution and clamps to [min_length, max_length].
+    Deterministic under the provided rng seed.
+    """
+
+    if min_length < 1:
+        raise ValueError("min_length must be >= 1")
+
+    if max_length < min_length:
+        raise ValueError("max_length must be >= min_length")
+
+    length = round(rng.gauss(avg_length, max(1.0, avg_length / 3.0)))
+    return max(min_length, min(max_length, length))
+
+
+def _wall_axis_steps(axis: str) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """
+    Return the two opposite axial step directions for a wall orientation.
+
+    These are the 3 natural straight-line families in axial coordinates:
+
+        q-axis wall direction: changes r, q constant-ish visually
+        r-axis wall direction: changes q
+        s-axis wall direction: changes q and r oppositely
+    """
+
+    if axis == "q":
+        return ((0, 1), (0, -1))
+
+    if axis == "r":
+        return ((1, 0), (-1, 0))
+
+    if axis == "s":
+        return ((1, -1), (-1, 1))
+
+    raise ValueError(f"Unknown wall axis: {axis}")
+
+
+def _walk_wall_segment(
+    start: "HexCoord",
+    step: Tuple[int, int],
+    length: int,
+) -> List["HexCoord"]:
+    """
+    Walk a straight wall segment from start for length cells.
+    """
+
+    dq, dr = step
+    cells = []
+
+    current = start
+
+    for _ in range(length):
+        cells.append(current)
+        current = HexCoord(current.q + dq, current.r + dr)
+
+    return cells
+
+
+def gen_walls(
+    center: "HexCoord",
+    radius: int,
+    *,
+    rng: random.Random,
+    exclude: Iterable["HexCoord"] = (),
+    num_walls: int = 20,
+    avg_length: float = 8.0,
+    min_length: int = 3,
+    max_length: int = 15,
+    wall_frequency=1.0,
+    gap_probability: float = 0.0,
+    avoid_touching_exclude: bool = True,
+) -> Set["HexCoord"]:
+    """
+    Generate random straight wall-segment obstacles.
+
+    Parameters
+    ----------
+    num_walls:
+        Number of wall segments to attempt.
+
+    avg_length:
+        Average wall length.
+
+    min_length:
+        Minimum wall length.
+
+    max_length:
+        Maximum wall length.
+
+    wall_frequency:
+        Relative orientation bias for the 3 axial directions.
+
+        Accepted forms:
+
+            scalar:
+                wall_frequency=1
+
+            tuple/list:
+                wall_frequency=(q_weight, r_weight, s_weight)
+
+            dict:
+                wall_frequency={"q": 2, "r": 1, "s": 1}
+
+        Zero disables that direction.
+
+    gap_probability:
+        Probability that an individual wall cell is skipped.
+
+        0.0 = solid walls
+        0.15 = broken/permeable walls
+        1.0 = no wall cells
+
+    avoid_touching_exclude:
+        If True, a wall segment is rejected if it would include an excluded cell.
+        This helps keep start/goal clear.
+
+    Returns
+    -------
+    Set[HexCoord]
+        Obstacle cells.
+    """
+
+    if radius < 0:
+        return set()
+
+    if num_walls < 0:
+        raise ValueError("num_walls must be >= 0")
+
+    if not 0.0 <= gap_probability <= 1.0:
+        raise ValueError("gap_probability must be between 0.0 and 1.0")
+
+    all_cells = set(hex_disk(center, radius))
+    exclude_set = set(exclude)
+
+    if not all_cells or num_walls == 0:
+        return set()
+
+    frequency = _normalize_wall_frequency(wall_frequency)
+
+    # Keep only positive-weight axes.
+    frequency = {
+        axis: weight
+        for axis, weight in frequency.items()
+        if weight > 0
+    }
+
+    if not frequency:
+        return set()
+
+    axes = list(frequency.keys())
+    weights = [frequency[axis] for axis in axes]
+
+    all_cells_list = list(all_cells)
+    walls: Set["HexCoord"] = set()
+
+    for _ in range(num_walls):
+        axis = rng.choices(axes, weights=weights, k=1)[0]
+
+        step_options = _wall_axis_steps(axis)
+        step = rng.choice(step_options)
+
+        start = rng.choice(all_cells_list)
+
+        length = _sample_wall_length(
+            rng=rng,
+            avg_length=avg_length,
+            min_length=min_length,
+            max_length=max_length,
+        )
+
+        segment = _walk_wall_segment(
+            start=start,
+            step=step,
+            length=length,
+        )
+
+        # Keep only segment cells inside the map disk.
+        segment = [
+            cell
+            for cell in segment
+            if cell in all_cells
+        ]
+
+        if not segment:
+            continue
+
+        if avoid_touching_exclude and any(cell in exclude_set for cell in segment):
+            continue
+
+        for cell in segment:
+            if cell in exclude_set:
+                continue
+
+            if rng.random() < gap_probability:
+                continue
+
+            walls.add(cell)
+
+    return walls
+
+
+register_obstacle_generator("walls", gen_walls)
+    
+# -----------------------------------------------------------------------------
+# Generator #4: track  (Build a road from start to goal)
 # -----------------------------------------------------------------------------
 
 # --- Track generator: 60° turns only, no self-intersection -----------------------

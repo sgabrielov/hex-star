@@ -8,12 +8,19 @@ from collections import defaultdict
 import math
 
 from dataclasses import dataclass
+import time
+import heapq
 
 @dataclass(frozen=True)
 class DirectionInfo:
     s: int # distance from origin
     blockers: List[HexCoord] # HexCoords that must be open for this hex to be navigable
 
+@dataclass
+class JoinResult:
+    forward_node: Node
+    reverse_node: Node
+    meeting_location: HexCoord
 
 DEFAULT_EPSILON = 1e-9
 class HStarProblem:
@@ -54,14 +61,21 @@ class HStarProblem:
         self.n_step = n_step
         self.epsilon = epsilon
 
+        self.heuristic_consistent_flag = True
+
+
 
         # if self.search_direction == "forward":
         #     self.transition_function = next_velocity
         # elif self.search_direction == "reverse":
         #     self.transition_function = prev_velocity
+        if search_direction == "forward":
+            self.transition_function = next_velocity
+            self.backtrack_transition_function = prev_velocity
+        elif search_direction == "reverse":
+            self.transition_function = prev_velocity
+            self.backtrack_transition_function = next_velocity
         
-        self.transition_function = next_velocity
-        self.transition_function = next_velocity
 
         self.DIRECTIONS = unique_direction_vectors_up_to_n(HexCoord(0,0), self.n_step)
         self.DIRECTIONS_INFO = {}
@@ -81,7 +95,7 @@ class HStarProblem:
             return node
         if self.goal_v.magnitude is None:
             return node
-        return self.backtrack(node, self.goal_v.magnitude, self.a_min, transition_function = self.transition_function)
+        return self.backtrack(node, self.goal_v.magnitude, -self.a_min, transition_function = self.backtrack_transition_function)
     
     def is_goal_loc(self, location: HexCoord) -> bool:
         """Return True when the agent is exactly at the goal hex."""
@@ -224,17 +238,73 @@ class HStarProblem:
         
     #     return travel_time_accel_limited(node.velocity.magnitude, new_v, s, self.a_max, self.a_min)
         
-    def constrain_velocity(self, node, next_location):
+
+    def constrain_velocity(
+        self,
+        node: Node,
+        next_location: Optional[HexCoord] = None,
+        forced_v_max: Optional[float] = None,
+    ):
+        """
+        If forced_v_max is provided, enforce that cap directly by backtracking.
+        Otherwise compute a turn-based cap from (node.parent, node, next_location).
+        """
         if node.parent is None:
             return None
-        radius = self.calculate_turning_radius(node, next_location)
-        if radius is None:
-            return None
-        v_max = math.sqrt(2*radius*self.ay_window_ms)
+    
+        if forced_v_max is not None:
+            v_max = forced_v_max
+        else:
+            if next_location is None:
+                return None
+            radius = self.calculate_turning_radius(node, next_location)
+            if radius is None:
+                return None
+            v_max = math.sqrt(2 * radius * self.ay_window_ms)
+    
         if node.velocity.magnitude <= v_max + self.epsilon:
-            return None # Do nothing
-        return self.backtrack(node, v_max, self.a_min, transition_function = self.transition_function)
-        
+            return None  # already valid, no repair needed
+    
+        return self.backtrack(
+            node,
+            v_max,
+            -self.a_min,
+            transition_function=self.backtrack_transition_function,
+        )
+    def reverse_dir_idx(self, dir_idx: Optional[int]) -> Optional[int]:
+        """
+        Return the index in self.DIRECTIONS corresponding to the opposite
+        of self.DIRECTIONS[dir_idx].
+    
+        Works for the expanded direction basis produced from
+        unique_direction_vectors_up_to_n(...), not just the 6 immediate
+        neighbor directions.
+    
+        Examples:
+            self.DIRECTIONS[0] = HexCoord(1, 0)   -> returns index of HexCoord(-1, 0)
+            self.DIRECTIONS[7] = HexCoord(-2, 1)  -> returns index of HexCoord(2, -1)
+        """
+        if dir_idx is None:
+            return None
+    
+        if dir_idx < 0 or dir_idx >= len(self.DIRECTIONS):
+            raise IndexError(
+                f"Direction index out of range: {dir_idx} "
+                f"(valid range: 0..{len(self.DIRECTIONS)-1})"
+            )
+    
+        vec = self.DIRECTIONS[dir_idx]
+        opposite_vec = HexCoord(-vec.q, -vec.r)
+    
+        try:
+            return self.DIRECTIONS.index(opposite_vec)
+        except ValueError:
+            raise ValueError(
+                f"Opposite direction {opposite_vec} for index {dir_idx} "
+                f"(vector {vec}) not found in self.DIRECTIONS. "
+                "Check that self.DIRECTIONS is symmetric under negation."
+            )
+         
     def reverse(
         self,
         goal_speed_mag: Optional[float] = None,
@@ -263,7 +333,7 @@ class HStarProblem:
             goal_speed_mag = self.goal_v.magnitude
 
         if goal_heading_idx is None:
-            goal_heading_idx = reverse_dir(self.goal_v.direction)
+            goal_heading_idx = self.reverse_dir_idx(self.goal_v.direction)
             
         rev_start_v = VelocityState(magnitude=goal_speed_mag,
                                     direction=goal_heading_idx
@@ -275,8 +345,8 @@ class HStarProblem:
             grid=self.grid,
             start=self.goal,     # swap endpoints
             goal=self.start,
-            a_max=self.a_min,    # keep positive magnitudes 
-            a_min=self.a_max,
+            a_max=-self.a_min,    # keep positive magnitudes 
+            a_min=-self.a_max,
             start_v=rev_start_v, # start speed at reversed start
             goal_v=self.start_v, # target end-state matches original start
             ay_window_ms=self.ay_window_ms,
@@ -354,6 +424,8 @@ class HStarProblem:
     def calculate_turning_radius(self, node, child_location):
         if node.parent is None:
             return None
+        if node.velocity.direction is None:
+            return 1
         parent = node.parent
         angle = angle_abc(parent.location, node.location, child_location)
 
@@ -412,6 +484,14 @@ class HStarProblem:
                 break
     
         return out
+
+    def reverse_dir_idx(self, dir_idx):
+        if dir_idx is None:
+            return None
+        dir_vect = self.DIRECTIONS[dir_idx]
+        reverse_dir_vect = reverse_dir(dir_vect)
+        reverse_dir_idx = self.DIRECTIONS.index(reverse_dir_vect)
+        return reverse_dir_idx
 # ------------------------------
 # Geometry & kinematics utilities
 # ------------------------------
@@ -549,6 +629,8 @@ def radius_from_angle(edge_length, angle, inscribed=False, degrees_in: bool = Fa
         return edge_length / (2 * math.sin(math.pi / n))
 
 def construct_full_solution(solution):
+    if solution is None:
+        return None
     fsolution_path = []
     for node in solution:
         if node.parent:
@@ -700,7 +782,7 @@ def h_cost_travel_time(problem: HStarProblem, node: Node) -> float:
     """
     steps = hex_manhattan_distance(node.location, problem.goal)
     distance = steps * hex_step_distance(problem.grid.hex_size)
-    a = problem.a_max
+    a = abs(problem.a_max)
     u = node.velocity.magnitude
     return travel_time(u,a,distance)
     
@@ -762,7 +844,10 @@ class HStarSearch:
         self.root.f_cost = self.root.g_cost + self.root.h_cost
         
         self.open_set.put((self.root.f_cost, -next(self._counter), self.root))
-        self.closed_set[self.root.location] = self.root
+        
+        closet_set_key = self.root.location
+        #closet_set_key = (self.root.location, self.root.velocity.direction)
+        self.closed_set[closet_set_key] = self.root
 
         self.open_set_sizes = []
         self.closed_set_sizes = []
@@ -799,6 +884,7 @@ class HStarSearch:
                 return soln_path
             for child in self.expand(node):
                 s = child.location
+                #s = (child.location, child.velocity.direction)
                 prev_best = self.closed_set.get(s)
                 if prev_best is None or child.g_cost < prev_best.g_cost - 1e-12:
                     self.closed_set[s] = child
@@ -812,6 +898,8 @@ class HStarSearch:
         for action in self.actions(node):
             child = self.result(node, action)
             self.benchmarks["states_reached"] += 1
+            if self.problem.heuristic_consistent_flag:
+                self.problem.heuristic_consistent_flag = self.check_h_consistency(self.problem, node, self.h)
             children.append(child)
         return children
 
@@ -822,7 +910,596 @@ class HStarSearch:
         return self.problem.action_cost(node, action)
     def result(self, node, action):
         return self.problem.result(node, action)
+    def check_h_consistency(self, problem, node, h):
+        if node is None:
+            return True
+        if node.parent is None:
+            return True
+        heuristic_is_consistent = h(problem, node.parent) <= node.g_cost + h(problem, node) + problem.epsilon
+        if not heuristic_is_consistent:
+                    hn = h(problem, node)
+                    hp =  h(problem, node.parent)
+                    ac = node.g_cost
+                    # print("h is inconsistent")
+                    # print(f'ac:        {ac}')
+                    # print(f'h(parent): {hp}')
+                    # print(f'h(node):   {hn}')
+                    # print(f'{hp} <= {ac} + {hn}  is false')
+                    # print(node)
+                    # print(node.parent)
+        return heuristic_is_consistent      
+    def get_benchmarks(self):
+        return self.benchmarks
+
+@dataclass
+class JoinResult:
+    forward_node: Node
+    reverse_node: Node
+    meeting_location: HexCoord
+
+
+class BidHStarSearch:
+    def __init__(
+        self,
+        problem: HStarProblem,
+        heuristic: Optional[HeuristicFn] = h_cost_travel_time,
+        join_tolerance: float = 1e-6,
+        state_key_mode: str = "location",
+        velocity_bin_size: float = 1.0,
+        enable_benchmarking: bool = True,
+        progress_every: Optional[int] = None,
+        progress_top_k: int = 5,
+    ) -> None:
+        self.problem = problem
+        self.reverse_problem = problem.reverse()
+
+        self.forward_search = HStarSearch(problem, heuristic)
+        self.reverse_search = HStarSearch(self.reverse_problem, heuristic)
+
+        self.join_tolerance = join_tolerance
+        self.heuristic = heuristic
+
+        self.state_key_mode = state_key_mode
+        self.velocity_bin_size = velocity_bin_size
+
+        self.enable_benchmarking = enable_benchmarking
+        self.progress_every = progress_every
+        self.progress_top_k = progress_top_k
+
+        self.forward_reached_best: Dict[object, Node] = {}
+        self.reverse_reached_best: Dict[object, Node] = {}
+
+        self.forward_reached_best[self._state_key(self.forward_search.root)] = self.forward_search.root
+        self.reverse_reached_best[self._state_key(self.reverse_search.root)] = self.reverse_search.root
+
+        self.benchmarks = {
+            "states_reached": 0,
+            "nodes_expanded": 0,
+            "search_time": 0,
+            "solution_cost": 0,
+            "solution_length": 0,
+            "open_set_sizes": [],
+            "closed_set_sizes": [],
+            "join_checks": 0,
+            "join_found": False,
+            "iterations": 0,
+            "progress_snapshots": [],
+        }
         
+    def _bench(self, key: str, value=1):
+        if not self.enable_benchmarking:
+            return
+    
+        if isinstance(value, (int, float)) and isinstance(self.benchmarks.get(key), (int, float)):
+            self.benchmarks[key] += value
+        else:
+            self.benchmarks[key] = value
+
+    def _node_summary(self, node: Node) -> dict:
+        return {
+            "node": node,   # <-- keep original node reference
+            "location": (node.location.q, node.location.r),
+            "g": node.g_cost,
+            "h": node.h_cost,
+            "f": node.f_cost,
+            "dir": node.velocity.direction,
+            "v": node.velocity.magnitude,
+        }
+
+    def _frontier_top_k(self, search: HStarSearch, k: int) -> List[dict]:
+        if search.open_set.empty():
+            return []
+    
+        top_items = heapq.nsmallest(k, search.open_set.queue)
+        return [self._node_summary(node) for _, _, node in top_items]
+        
+    def _record_progress_snapshot(self):
+        if not self.enable_benchmarking:
+            return
+    
+        if self.progress_every is None:
+            return
+    
+        iteration = self.benchmarks["iterations"]
+        if iteration % self.progress_every != 0:
+            return
+    
+        snapshot = {
+            "iteration": iteration,
+            "forward_open_size": self.forward_search.open_set.qsize(),
+            "reverse_open_size": self.reverse_search.open_set.qsize(),
+            "forward_closed_size": len(self.forward_search.closed_set),
+            "reverse_closed_size": len(self.reverse_search.closed_set),
+            "forward_top": self._frontier_top_k(self.forward_search, self.progress_top_k),
+            "reverse_top": self._frontier_top_k(self.reverse_search, self.progress_top_k),
+        }
+    
+        self.benchmarks["progress_snapshots"].append(snapshot)
+    def snapshot_with_paths(self, snapshot: dict) -> dict:
+        """
+        Takes one progress snapshot and returns a new snapshot where
+        forward_top and reverse_top entries also include reconstruct_path(node).
+        """
+        out = dict(snapshot)
+    
+        def add_paths(entries):
+            processed = []
+            for entry in entries:
+                node = entry["node"]
+                processed.append({
+                    **entry,
+                    "path": self.reconstruct_path(node),
+                })
+            return processed
+    
+        out["forward_top"] = add_paths(snapshot.get("forward_top", []))
+        out["reverse_top"] = add_paths(snapshot.get("reverse_top", []))
+        return out
+    
+    # ------------------------------------------------------------------
+    # State key helpers
+    # ------------------------------------------------------------------
+    
+    def _velocity_bin(self, v: Optional[float]) -> Optional[int]:
+        if v is None:
+            return None
+        return int(v // self.velocity_bin_size)
+    
+    def _state_key(self, node: Node):
+        """
+        Key used to store/retrieve the best state in a frontier.
+        """
+        if self.state_key_mode == "location":
+            return node.location
+    
+        if self.state_key_mode == "location_direction":
+            return (node.location, node.velocity.direction)
+    
+        if self.state_key_mode == "location_velocity_bin":
+            return (node.location, self._velocity_bin(node.velocity.magnitude))
+    
+        raise ValueError(f"Unknown state_key_mode: {self.state_key_mode}")
+    
+    def _join_lookup_key(self, node: Node):
+        """
+        Key used to look up a candidate in the opposite frontier.
+    
+        Important:
+          - location: same location
+          - location_direction: opposite direction in the other search
+          - location_velocity_bin: same location + same velocity bin
+        """
+        if self.state_key_mode == "location":
+            return node.location
+    
+        if self.state_key_mode == "location_direction":
+            d = node.velocity.direction
+            if d is None:
+                return (node.location, None)
+            return (node.location, self.problem.reverse_dir_idx(d))
+    
+        if self.state_key_mode == "location_velocity_bin":
+            return (node.location, self._velocity_bin(node.velocity.magnitude))
+    
+        raise ValueError(f"Unknown state_key_mode: {self.state_key_mode}")
+        
+    def _better_node(self, new_node: Node, old_node: Optional[Node]) -> bool:
+        if old_node is None:
+            return True
+    
+        eps = self.problem.epsilon
+    
+        if new_node.f_cost < old_node.f_cost - eps:
+            return True
+    
+        # optional tie-break: lower g_cost wins
+        if abs(new_node.f_cost - old_node.f_cost) <= eps and new_node.g_cost < old_node.g_cost - eps:
+            return True
+    
+        return False
+
+    # ------------------------------------------------------------------
+    # Join logic
+    # ------------------------------------------------------------------
+
+    def _directions_compatible(self, fwd_node: Node, rev_node: Node) -> bool:
+        """
+        Join requires opposite headings:
+            rev_dir == reverse_dir_idx(fwd_dir)
+        """
+        fwd_dir = fwd_node.velocity.direction
+        rev_dir = rev_node.velocity.direction
+
+        if fwd_dir is None or rev_dir is None:
+            return False
+
+        return rev_dir == self.problem.reverse_dir_idx(fwd_dir)
+
+    def _velocities_within_tolerance(self, n1: Node, n2: Node) -> bool:
+        v1 = n1.velocity.magnitude
+        v2 = n2.velocity.magnitude
+
+        if v1 is None or v2 is None:
+            return False
+
+        return abs(v1 - v2) <= self.join_tolerance
+
+    def _repair_join_speeds(
+        self,
+        fwd_node: Node,
+        rev_node: Node,
+    ) -> Optional[Tuple[Node, Node]]:
+        vf = fwd_node.velocity.magnitude
+        vr = rev_node.velocity.magnitude
+    
+        # print("\n[JOIN SPEED REPAIR]")
+        # print(self._dbg_node_str("incoming_forward_node", fwd_node))
+        # print("-" * 100)
+        # print(self._dbg_node_str("incoming_reverse_node", rev_node))
+    
+        if vf is None or vr is None:
+            # print("repair failed: one of the speeds is None")
+            return None
+    
+        # print(f"vf={vf:.12f}, vr={vr:.12f}, abs_diff={abs(vf - vr):.12f}")
+    
+        # Already effectively equal
+        if abs(vf - vr) <= self.problem.epsilon:
+            # print("repair not needed: speeds already equal within epsilon")
+            return fwd_node, rev_node
+    
+        if vf > vr:
+            # print(f"repair action: constrain FORWARD branch from {vf:.12f} down to {vr:.12f}")
+            repaired_fwd = self.problem.constrain_velocity(fwd_node, forced_v_max=vr)
+            if repaired_fwd is None:
+                # print("repair failed: constrain_velocity on FORWARD branch returned None")
+                return None
+            # print("repair success: FORWARD branch adjusted")
+            # print(self._dbg_node_str("repaired_forward_node", repaired_fwd))
+            return repaired_fwd, rev_node
+        else:
+            # print(f"repair action: constrain REVERSE branch from {vr:.12f} down to {vf:.12f}")
+            repaired_rev = self.reverse_problem.constrain_velocity(rev_node, forced_v_max=vf)
+            if repaired_rev is None:
+                # print("repair failed: constrain_velocity on REVERSE branch returned None")
+                return None
+            # print("repair success: REVERSE branch adjusted")
+            # print(self._dbg_node_str("repaired_reverse_node", repaired_rev))
+            return fwd_node, repaired_rev
+            
+    def _try_join(self, child: Node, other: Node, expanding_forward: bool) -> Optional[JoinResult]:
+        if self.enable_benchmarking:
+            self.benchmarks["join_checks"] += 1
+    
+        if expanding_forward:
+            fwd_node, rev_node = child, other
+        else:
+            fwd_node, rev_node = other, child
+    
+        dir_ok = self._directions_compatible(fwd_node, rev_node)
+        vel_ok = self._velocities_within_tolerance(fwd_node, rev_node)
+    
+        # self._print_join_debug(
+        #     child=child,
+        #     other=other,
+        #     expanding_forward=expanding_forward,
+        #     fwd_node=fwd_node,
+        #     rev_node=rev_node,
+        #     dir_ok=dir_ok,
+        #     vel_ok=vel_ok,
+        # )
+    
+        if not dir_ok:
+            return None
+    
+        if not vel_ok:
+            return None
+    
+        # print("[JOIN DEBUG] attempting speed repair...")
+        repaired = self._repair_join_speeds(fwd_node, rev_node)
+    
+        if repaired is None:
+            # print("[JOIN DEBUG] speed repair failed -> join rejected")
+            return None
+    
+        repaired_fwd, repaired_rev = repaired
+    
+        # print("[JOIN DEBUG] speed repair succeeded")
+        # print(self._dbg_node_str("repaired_forward_node", repaired_fwd))
+        # print("-" * 100)
+        # print(self._dbg_node_str("repaired_reverse_node", repaired_rev))
+    
+        if self.enable_benchmarking:
+            self.benchmarks["join_found"] = True
+    
+        # print("[JOIN DEBUG] JOIN ACCEPTED")
+        # print("=" * 100)
+    
+        return JoinResult(
+            forward_node=repaired_fwd,
+            reverse_node=repaired_rev,
+            meeting_location=repaired_fwd.location,
+        )
+        
+    def stitch_joined_paths(self, join: JoinResult) -> List[Node]:
+        fwd = self.reconstruct_path(join.forward_node)   # [start, ..., join]
+        rev = self.reconstruct_path(join.reverse_node)   # [goal, ..., join]
+    
+        path = list(fwd)
+    
+        # walk reverse path backward, skipping the duplicate join at the end
+        for i in range(len(rev) - 2, -1, -1):
+            prev_rev = rev[i + 1]   # closer to join
+            curr_rev = rev[i]       # next toward goal
+    
+            step_cost = prev_rev.g_cost - curr_rev.g_cost
+    
+            stitched = Node(
+                location=curr_rev.location,
+                velocity=curr_rev.velocity,
+                parent=path[-1],
+                step_distance=curr_rev.step_distance,
+                g_cost=path[-1].g_cost + step_cost,
+                h_cost=curr_rev.h_cost,
+                f_cost=0.0,
+            )
+            stitched.f_cost = stitched.g_cost + stitched.h_cost
+            path.append(stitched)
+    
+        return path
+
+    def reconstruct_path(self, node: Node) -> List[Node]:
+        out: List[Node] = []
+        cur = node
+        while cur is not None:
+            out.append(cur)
+            cur = cur.parent
+        out.reverse()
+        return out
+    # ------------------------------------------------------------------
+    # One expansion step on either frontier
+    # ------------------------------------------------------------------
+
+    def _proceed_one_side(self, expanding_forward: bool) -> Optional[JoinResult]:
+        if expanding_forward:
+            search = self.forward_search
+            reached_best = self.forward_reached_best
+            other_reached_best = self.reverse_reached_best
+        else:
+            search = self.reverse_search
+            reached_best = self.reverse_reached_best
+            other_reached_best = self.forward_reached_best
+    
+        if search.open_set.empty():
+            return None
+    
+        _, _, node = search.open_set.get(False)
+    
+        if self.enable_benchmarking:
+            self.benchmarks["nodes_expanded"] += 1
+    
+        for child in search.expand(node):
+            if self.enable_benchmarking:
+                self.benchmarks["states_reached"] += 1
+    
+            state_key = self._state_key(child)
+            prev_best = reached_best.get(state_key)
+    
+            if self._better_node(child, prev_best):
+                reached_best[state_key] = child
+                search.closed_set[state_key] = child
+    
+                f = child.g_cost + search.h(search.problem, child)
+                search.open_set.put((f, -next(search._counter), child))
+    
+                join_key = self._join_lookup_key(child)
+                other = other_reached_best.get(join_key)
+    
+                if other is not None:
+                    join = self._try_join(
+                        child=child,
+                        other=other,
+                        expanding_forward=expanding_forward,
+                    )
+                    if join is not None:
+                        return join
+    
+        return None
+    # ------------------------------------------------------------------
+    # Debug Helpers
+    # ------------------------------------------------------------------
+    def _dbg_dir_str(self, d) -> str:
+        if d is None:
+            return "None"
+        try:
+            vec = self.problem.DIRECTIONS[d]
+            rev_idx = self.problem.reverse_dir_idx(d)
+            rev_vec = self.problem.DIRECTIONS[rev_idx]
+            return f"{d} -> {vec} | reverse={rev_idx} -> {rev_vec}"
+        except Exception as e:
+            return f"{d} -> <invalid: {e}>"
+    
+    def _dbg_vel_str(self, vel) -> str:
+        if vel is None:
+            return "None"
+        mag = getattr(vel, "magnitude", None)
+        direction = getattr(vel, "direction", None)
+        mag_s = "None" if mag is None else f"{mag:.12f}"
+        return f"(mag={mag_s}, dir={self._dbg_dir_str(direction)})"
+    
+    def _dbg_node_str(self, label: str, node) -> str:
+        if node is None:
+            return f"{label}: None"
+        parts = [
+            f"{label}:",
+            f"  loc={node.location}",
+            f"  vel={self._dbg_vel_str(node.velocity)}",
+        ]
+        if hasattr(node, "g_cost"):
+            g = getattr(node, "g_cost", None)
+            parts.append(f"  g_cost={g if g is None else round(g, 12)}")
+        if hasattr(node, "h_cost"):
+            h = getattr(node, "h_cost", None)
+            parts.append(f"  h_cost={h if h is None else round(h, 12)}")
+        if hasattr(node, "f_cost"):
+            f = getattr(node, "f_cost", None)
+            parts.append(f"  f_cost={f if f is None else round(f, 12)}")
+        if hasattr(node, "step_distance"):
+            sd = getattr(node, "step_distance", None)
+            parts.append(f"  step_distance={sd}")
+        if getattr(node, "parent", None) is not None:
+            parts.append(f"  parent_loc={node.parent.location}")
+            parts.append(f"  parent_vel={self._dbg_vel_str(node.parent.velocity)}")
+        else:
+            parts.append("  parent_loc=None")
+        return "\n".join(parts)
+    
+    def _print_join_debug(
+        self,
+        child,
+        other,
+        expanding_forward: bool,
+        fwd_node,
+        rev_node,
+        dir_ok: bool,
+        vel_ok: bool,
+    ):
+        print("\n" + "=" * 100)
+        print("[JOIN DEBUG]")
+        print(f"expanding_forward={expanding_forward}")
+        print(f"join_tolerance={self.join_tolerance}")
+        print(f"epsilon={getattr(self.problem, 'epsilon', None)}")
+        print("-" * 100)
+    
+        print(self._dbg_node_str("child", child))
+        print("-" * 100)
+        print(self._dbg_node_str("other", other))
+        print("-" * 100)
+        print(self._dbg_node_str("forward_node", fwd_node))
+        print("-" * 100)
+        print(self._dbg_node_str("reverse_node", rev_node))
+        print("-" * 100)
+    
+        fd = fwd_node.velocity.direction
+        rd = rev_node.velocity.direction
+        vf = fwd_node.velocity.magnitude
+        vr = rev_node.velocity.magnitude
+    
+        print(f"fwd_dir={self._dbg_dir_str(fd)}")
+        print(f"rev_dir={self._dbg_dir_str(rd)}")
+    
+        if fd is not None:
+            print(f"reverse_dir_idx(fwd_dir)={self.problem.reverse_dir_idx(fd)} "
+                  f"-> {self.problem.DIRECTIONS[self.problem.reverse_dir_idx(fd)]}")
+        if rd is not None:
+            print(f"reverse_dir_idx(rev_dir)={self.problem.reverse_dir_idx(rd)} "
+                  f"-> {self.problem.DIRECTIONS[self.problem.reverse_dir_idx(rd)]}")
+    
+        print(f"direction_compatible={dir_ok}")
+    
+        if vf is None or vr is None:
+            print(f"vf={vf}, vr={vr}, abs_diff=<n/a>")
+        else:
+            print(f"vf={vf:.12f}, vr={vr:.12f}, abs_diff={abs(vf - vr):.12f}")
+    
+        print(f"velocity_within_tolerance={vel_ok}")
+    
+        if not dir_ok:
+            print("JOIN REJECT REASON: direction mismatch")
+        elif not vel_ok:
+            print("JOIN REJECT REASON: speed mismatch (before repair)")
+        else:
+            print("JOIN PASSED INITIAL DIRECTION + SPEED CHECKS")
+    
+        print("=" * 100)
+
+
+
+    # ------------------------------------------------------------------
+    # Main search loop
+    # ------------------------------------------------------------------
+
+    def _peek_f(self, search: HStarSearch) -> float:
+        if search.open_set.empty():
+            return math.inf
+        f, _, _ = search.open_set.queue[0]
+        return f
+
+    def search(self) -> Optional[List[Node]]:
+        start_time = time.time()
+    
+        while not self.forward_search.open_set.empty() and not self.reverse_search.open_set.empty():
+            if self.enable_benchmarking:
+                self.benchmarks["iterations"] += 1
+                self.benchmarks["open_set_sizes"].append(
+                    self.forward_search.open_set.qsize() + self.reverse_search.open_set.qsize()
+                )
+                self.benchmarks["closed_set_sizes"].append(
+                    len(self.forward_search.closed_set) + len(self.reverse_search.closed_set)
+                )
+                self._record_progress_snapshot()
+    
+            fwd_top = self._peek_f(self.forward_search)
+            rev_top = self._peek_f(self.reverse_search)
+    
+            if fwd_top <= rev_top:
+                join = self._proceed_one_side(expanding_forward=True)
+            else:
+                join = self._proceed_one_side(expanding_forward=False)
+    
+                if join is not None:
+                    path = self.stitch_joined_paths(join)
+                
+                    if self.enable_benchmarking:
+                        search_time = time.time() - start_time
+                
+                        solution_length = len(path) if path else 0
+                        solution_depth = max(solution_length - 1, 0)
+                
+                        nodes_expanded = self.benchmarks.get("nodes_expanded", 0)
+                
+                        nodes_for_ebf = nodes_expanded + 1
+                
+                        self.benchmarks["search_time"] = search_time
+                        self.benchmarks["solution_cost"] = path[-1].g_cost if path else 0
+                        self.benchmarks["solution_length"] = solution_length
+                        self.benchmarks["solution_depth"] = solution_depth
+                        self.benchmarks["effective_branching_factor"] = effective_branching_factor(
+                            nodes=nodes_for_ebf,
+                            depth=solution_depth
+                        )
+                
+                    return path
+
+        if self.enable_benchmarking:
+            self.benchmarks["search_time"] = time.time() - start_time
+            self.benchmarks["solution_cost"] = None
+            self.benchmarks["solution_length"] = None
+            self.benchmarks["solution_depth"] = None
+            self.benchmarks["effective_branching_factor"] = None
+        
+        return None
+
     def get_benchmarks(self):
         return self.benchmarks
 
@@ -842,3 +1519,114 @@ def velocity_stddev(path: List[Node]) -> Tuple[float, float]:
     Return (stddev_speed, stddev_heading_change) along the path.
     """
     pass
+
+
+# ------------------------------------------------------------------
+# Benchmarking Helpers
+# ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Benchmarking Helpers
+# ------------------------------------------------------------------
+
+def geometric_sum_capped(b, depth, cap):
+    """
+    Compute:
+
+        1 + b + b^2 + ... + b^depth
+
+    without using exponentiation and without allowing overflow.
+
+    The function stops early once the sum exceeds cap, because the
+    effective branching factor solver only needs to know whether the
+    estimate is below or above the target node count.
+    """
+    if depth is None:
+        return None
+
+    if depth < 0:
+        return None
+
+    total = 1.0
+    term = 1.0
+
+    for _ in range(depth):
+        term = term * b
+        total = total + term
+
+        if total > cap:
+            return total
+
+    return total
+
+
+def effective_branching_factor(nodes, depth, tolerance=0.000001, max_iter=100):
+    """
+    Solve the geometric-series relationship:
+
+        nodes = 1 + b + b^2 + ... + b^depth
+
+    for b.
+
+    Parameters
+    ----------
+    nodes:
+        Total node count used for the estimate. For expanded nodes,
+        pass nodes_expanded + 1 if nodes_expanded does not include
+        the root/start node.
+
+    depth:
+        Solution depth, usually len(path) - 1.
+
+    tolerance:
+        Numeric stopping tolerance.
+
+    max_iter:
+        Maximum binary-search iterations.
+
+    Returns
+    -------
+    float or None
+        Effective branching factor.
+    """
+    if nodes is None or depth is None:
+        return None
+
+    if depth <= 0:
+        return None
+
+    nodes = float(nodes)
+
+    if nodes <= 1:
+        return 0.0
+
+    if nodes <= depth + 1:
+        return 1.0
+
+    low = 1.0
+    high = 2.0
+
+    while geometric_sum_capped(high, depth, nodes) < nodes:
+        high = high * 2.0
+
+        if high > nodes:
+            high = nodes
+            break
+
+    for _ in range(max_iter):
+        mid = (low + high) / 2.0
+
+        estimate = geometric_sum_capped(
+            b=mid,
+            depth=depth,
+            cap=nodes
+        )
+
+        if abs(estimate - nodes) <= tolerance:
+            return mid
+
+        if estimate < nodes:
+            low = mid
+        else:
+            high = mid
+
+    return (low + high) / 2.0
