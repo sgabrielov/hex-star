@@ -305,11 +305,12 @@ def plot_hex_grid_2(
     ax.grid(False)
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_xlabel("x", color="#333333")
-    ax.set_ylabel("y", color="#333333")
-    ax.set_title(
-        f"Hex grid (radius={radius}) centered at ({center.q},{center.r}) {plt_title}"
-    )
+    # ax.set_xlabel("x", color="#333333")
+    # ax.set_ylabel("y", color="#333333")
+    if plt_title:
+        ax.set_title(
+            f"{plt_title}"
+        )
 
     # ---- Corner-anchored axis arrows ----
     if draw_axes:
@@ -391,7 +392,7 @@ def plot_hex_grid_2(
         plt.tight_layout()
     
     if save_path is not None:
-        ax.figure.savefig(save_path, dpi=300, bbox_inches="tight")
+        ax.figure.savefig(save_path, dpi=100, bbox_inches="tight")
     
         if created_fig:
             plt.close(ax.figure)
@@ -1179,6 +1180,84 @@ def animate_progress_dual_view_with_solution(
         fig,
         update,
         frames=n_progress + 1,   # +1 for the final solution frame
+        interval=interval,
+        repeat=repeat,
+        blit=False,
+    )
+
+    return anim, fig, (ax_left, ax_right)
+
+def animate_progress_dual_view(
+    progress_snapshots,
+    snapshot_with_paths_fn,
+    obstacles,
+    start,
+    center,
+    radius,
+    goal=None,
+    figsize=(16, 9),
+    interval=300,
+    repeat=False,
+    show_coords=False,
+    linewidth=0,
+    title_prefix="Bidirectional Search Progress",
+    step=1,
+):
+    sampled = progress_snapshots[::step]
+
+    fig, (ax_left, ax_right) = plt.subplots(
+        1, 2, figsize=figsize
+    )
+
+    def update(i):
+        snap = sampled[i]
+
+        processed = snapshot_with_paths_fn(snap)
+
+        hc_left = snapshot_paths_hexcoord_set(
+            processed,
+            solid=False,
+        )
+
+        hc_right = snapshot_paths_hexcoord_set(
+            processed,
+            solid=True,
+        )
+
+        iter_label = snap.get("iteration", i)
+
+        plot_hex_grid_2(
+            obstacles,
+            start,
+            center,
+            radius,
+            goal=goal,
+            show_coords=show_coords,
+            path=hc_left,
+            linewidth=linewidth,
+            plt_title=f"{title_prefix} | Frontier Nodes Only\nframe={i} | iteration={iter_label}",
+            ax=ax_left,
+        )
+
+        plot_hex_grid_2(
+            obstacles,
+            start,
+            center,
+            radius,
+            goal=goal,
+            show_coords=show_coords,
+            path=hc_right,
+            linewidth=linewidth,
+            plt_title=f"{title_prefix} | Full Path View\nframe={i} | iteration={iter_label}",
+            ax=ax_right,
+        )
+
+        return ()
+
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=len(sampled),
         interval=interval,
         repeat=repeat,
         blit=False,

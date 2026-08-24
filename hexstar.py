@@ -972,6 +972,7 @@ class BidHStarSearch:
         self.forward_reached_best[self._state_key(self.forward_search.root)] = self.forward_search.root
         self.reverse_reached_best[self._state_key(self.reverse_search.root)] = self.reverse_search.root
 
+        self.expand_forward_next = True 
         self.benchmarks = {
             "states_reached": 0,
             "nodes_expanded": 0,
@@ -1195,7 +1196,14 @@ class BidHStarSearch:
             fwd_node, rev_node = child, other
         else:
             fwd_node, rev_node = other, child
-    
+        if (
+            fwd_node.velocity.direction is None
+            or rev_node.velocity.direction is None
+        ):
+            return None
+            # print(
+            #     "[JOIN DEBUG] candidate involves root node"
+            # )
         dir_ok = self._directions_compatible(fwd_node, rev_node)
         vel_ok = self._velocities_within_tolerance(fwd_node, rev_node)
     
@@ -1240,7 +1248,8 @@ class BidHStarSearch:
             reverse_node=repaired_rev,
             meeting_location=repaired_fwd.location,
         )
-        
+
+
     def stitch_joined_paths(self, join: JoinResult) -> List[Node]:
         fwd = self.reconstruct_path(join.forward_node)   # [start, ..., join]
         rev = self.reconstruct_path(join.reverse_node)   # [goal, ..., join]
@@ -1459,37 +1468,42 @@ class BidHStarSearch:
                 )
                 self._record_progress_snapshot()
     
-            fwd_top = self._peek_f(self.forward_search)
-            rev_top = self._peek_f(self.reverse_search)
+            # fwd_top = self._peek_f(self.forward_search)
+            # rev_top = self._peek_f(self.reverse_search)
     
-            if fwd_top <= rev_top:
-                join = self._proceed_one_side(expanding_forward=True)
-            else:
-                join = self._proceed_one_side(expanding_forward=False)
-    
-                if join is not None:
-                    path = self.stitch_joined_paths(join)
-                
-                    if self.enable_benchmarking:
-                        search_time = time.time() - start_time
-                
-                        solution_length = len(path) if path else 0
-                        solution_depth = max(solution_length - 1, 0)
-                
-                        nodes_expanded = self.benchmarks.get("nodes_expanded", 0)
-                
-                        nodes_for_ebf = nodes_expanded + 1
-                
-                        self.benchmarks["search_time"] = search_time
-                        self.benchmarks["solution_cost"] = path[-1].g_cost if path else 0
-                        self.benchmarks["solution_length"] = solution_length
-                        self.benchmarks["solution_depth"] = solution_depth
-                        self.benchmarks["effective_branching_factor"] = effective_branching_factor(
-                            nodes=nodes_for_ebf,
-                            depth=solution_depth
-                        )
-                
-                    return path
+            # if fwd_top <= rev_top:
+            #     join = self._proceed_one_side(expanding_forward=True)
+            # else:
+            #     join = self._proceed_one_side(expanding_forward=False)
+            expanding_forward = self.expand_forward_next
+            self.expand_forward_next = not self.expand_forward_next
+            
+            join = self._proceed_one_side(
+                expanding_forward=expanding_forward
+            )
+            if join is not None:
+                path = self.stitch_joined_paths(join)
+            
+                if self.enable_benchmarking:
+                    search_time = time.time() - start_time
+            
+                    solution_length = len(path) if path else 0
+                    solution_depth = max(solution_length - 1, 0)
+            
+                    nodes_expanded = self.benchmarks.get("nodes_expanded", 0)
+            
+                    nodes_for_ebf = nodes_expanded + 1
+            
+                    self.benchmarks["search_time"] = search_time
+                    self.benchmarks["solution_cost"] = path[-1].g_cost if path else 0
+                    self.benchmarks["solution_length"] = solution_length
+                    self.benchmarks["solution_depth"] = solution_depth
+                    self.benchmarks["effective_branching_factor"] = effective_branching_factor(
+                        nodes=nodes_for_ebf,
+                        depth=solution_depth
+                    )
+            
+                return path
 
         if self.enable_benchmarking:
             self.benchmarks["search_time"] = time.time() - start_time
