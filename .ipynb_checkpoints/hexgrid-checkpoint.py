@@ -1120,8 +1120,370 @@ def gen_random_obstacles(
 register_obstacle_generator("random_n", gen_random_obstacles)
 
 
-from typing import Iterable, Set
-# assumes HexCoord, hex_disk (or _hex_disk), and register_obstacle_generator are already defined
+# -----------------------------------------------------------------------------
+# Generator: clustered_n
+# -----------------------------------------------------------------------------
+def grow_blob_cluster(
+    seed: "HexCoord",
+    desired_size: int,
+    available: Set["HexCoord"],
+    *,
+    rng: random.Random,
+    max_radial_difference: int = 1,
+) -> Set["HexCoord"]:
+
+    if desired_size <= 0:
+        return set()
+
+    cluster = {seed}
+
+    frontier = set()
+
+    def add_neighbors(cell):
+        for dq, dr in DIRECTIONS:
+            neighbor = HexCoord(
+                cell.q + dq,
+                cell.r + dr,
+            )
+
+            if (
+                neighbor in available
+                and neighbor not in cluster
+            ):
+                frontier.add(neighbor)
+
+    add_neighbors(seed)
+
+    while len(cluster) < desired_size and frontier:
+
+        # Find the innermost radius that is not yet completely filled.
+        min_frontier_radius = min(
+            hdist(seed, cell)
+            for cell in frontier
+        )
+
+        valid_cells = [
+            cell
+            for cell in frontier
+            if hdist(seed, cell)
+            <= min_frontier_radius + max_radial_difference
+        ]
+
+        next_cell = rng.choice(valid_cells)
+
+        frontier.remove(next_cell)
+        cluster.add(next_cell)
+
+        add_neighbors(next_cell)
+
+    return cluster
+
+
+def gen_clustered_obstacles(
+    center: "HexCoord",
+    radius: int,
+    *,
+    rng: random.Random,
+    exclude: Iterable["HexCoord"] = (),
+    n: int,
+    min_cluster_size: int,
+    max_cluster_size: int,
+    cluster_generator: Callable[..., Set["HexCoord"]] = grow_blob_cluster,
+    max_layout_attempts: int = 100,
+) -> Set["HexCoord"]:
+    """
+    Place up to n obstacles in randomly positioned, non-overlapping clusters
+    within the hex disk.
+
+    This function determines:
+
+        1. How many obstacle cells can be placed.
+        2. How many clusters to create.
+        3. The size of each cluster.
+        4. Where each cluster begins.
+        5. Whether a generated cluster is valid.
+        6. Whether the complete layout should be retried.
+
+    The supplied cluster_generator determines the shape of each individual
+    cluster.
+
+    Clusters may border one another, but they cannot overlap. Coordinates
+    passed through exclude are never used.
+
+    When min_cluster_size == 1 and max_cluster_size == 1, the function uses
+    uniform random sampling equivalent to the original random_n generator.
+
+    Parameters
+    ----------
+    center : HexCoord
+        Center of the allowed hex disk.
+    radius : int
+        Radius of the allowed disk in hex steps.
+    rng : random.Random
+        RNG instance used for reproducibility.
+    exclude : Iterable[HexCoord]
+        Coordinates that must remain free.
+    n : int
+        Requested total number of obstacle cells.
+    min_cluster_size : int
+        Minimum permitted size of each cluster.
+    max_cluster_size : int
+        Maximum permitted size of each cluster.
+    cluster_generator : Callable
+        Function used to generate the shape of one cluster. It must accept:
+
+            seed
+            desired_size
+            available
+            rng
+
+        and return a Set[HexCoord].
+    max_layout_attempts : int
+        Maximum number of times to retry the complete cluster layout.
+
+    Returns
+    -------
+    Set[HexCoord]
+        Generated obstacle coordinates.
+    """
+    if radius < 0:
+        raise ValueError(
+            "radius must be greater than or equal to 0"
+        )
+
+    if min_cluster_size <= 0:
+        raise ValueError(
+            "min_cluster_size must be greater than 0"
+        )
+
+    if max_cluster_size < min_cluster_size:
+        raise ValueError(
+            "max_cluster_size must be greater than or equal to "
+            "min_cluster_size"
+        )
+
+    if max_layout_attempts <= 0:
+        raise ValueError(
+            "max_layout_attempts must be greater than 0"
+        )
+
+    if not callable(cluster_generator):
+        raise TypeError(
+            "cluster_generator must be callable"
+        )
+
+    if n <= 0:
+        return set()
+
+    excluded: Set["HexCoord"] = (
+        set(exclude)
+        if exclude
+        else set()
+    )
+
+    # Preserve the order produced by hex_disk for reproducible RNG behavior.
+    candidates: List["HexCoord"] = [
+        coord
+        for coord in hex_disk(center, radius)
+        if coord not in excluded
+    ]
+
+    if not candidates:
+        return set()
+
+    target_count = min(n, len(candidates))
+
+    # Each one-cell cluster is simply one uniformly sampled obstacle.
+    # This preserves the behavior of the original random_n generator.
+    if min_cluster_size == 1 and max_cluster_size == 1:
+        return set(
+            rng.sample(
+                candidates,
+                target_count,
+            )
+        )
+
+    def get_cluster_count_range(
+        total: int,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Determine the valid range for the number of clusters needed to
+        represent total exactly.
+
+        The minimum number occurs when clusters are as large as possible.
+        The maximum number occurs when clusters are as small as possible.
+        """
+        minimum_cluster_count = (
+            total + max_cluster_size - 1
+        ) // max_cluster_size
+
+        maximum_cluster_count = (
+            total // min_cluster_size
+        )
+
+        if minimum_cluster_count > maximum_cluster_count:
+            return None
+
+        return (
+            minimum_cluster_count,
+            maximum_cluster_count,
+        )
+
+    # Find the largest count, no greater than target_count, that can be divided
+    # exactly into clusters within the requested size range.
+    placeable_count = target_count
+    cluster_count_range = get_cluster_count_range(
+        placeable_count
+    )
+
+    while (
+        placeable_count > 0
+        and cluster_count_range is None
+    ):
+        placeable_count -= 1
+        cluster_count_range = get_cluster_count_range(
+            placeable_count
+        )
+
+    if (
+        placeable_count == 0
+        or cluster_count_range is None
+    ):
+        return set()
+
+    minimum_cluster_count, maximum_cluster_count = (
+        cluster_count_range
+    )
+
+    def create_cluster_sizes() -> List:
+        """
+        Randomly partition placeable_count into valid cluster sizes.
+        """
+        cluster_count = rng.randint(
+            minimum_cluster_count,
+            maximum_cluster_count,
+        )
+
+        # Begin every cluster at the configured minimum.
+        cluster_sizes = [
+            min_cluster_size
+            for _ in range(cluster_count)
+        ]
+
+        remaining = (
+            placeable_count
+            - cluster_count * min_cluster_size
+        )
+
+        # Randomly distribute the remaining obstacle cells.
+        while remaining > 0:
+            expandable_indices = [
+                index
+                for index, cluster_size
+                in enumerate(cluster_sizes)
+                if cluster_size < max_cluster_size
+            ]
+
+            if not expandable_indices:
+                raise RuntimeError(
+                    "Unable to distribute obstacle cells among clusters"
+                )
+
+            selected_index = rng.choice(
+                expandable_indices
+            )
+
+            cluster_sizes[selected_index] += 1
+            remaining -= 1
+
+        # Larger clusters are more difficult to place, so place them first.
+        cluster_sizes.sort(reverse=True)
+
+        return cluster_sizes
+
+    cluster_sizes = create_cluster_sizes()
+    candidate_set: Set["HexCoord"] = set(candidates)
+
+    best_obstacles: Set["HexCoord"] = set()
+
+    for _ in range(max_layout_attempts):
+        obstacles: Set["HexCoord"] = set()
+        layout_complete = True
+
+        for cluster_size in cluster_sizes:
+            available = candidate_set - obstacles
+
+            if len(available) < cluster_size:
+                layout_complete = False
+                break
+
+            # Create the seed list using the stable candidate ordering before
+            # shuffling it with the supplied RNG.
+            possible_seeds = [
+                coord
+                for coord in candidates
+                if coord in available
+            ]
+
+            rng.shuffle(possible_seeds)
+
+            placed_cluster: Optional[
+                Set["HexCoord"]
+            ] = None
+
+            for seed in possible_seeds:
+                generated_cluster = cluster_generator(
+                    seed=seed,
+                    desired_size=cluster_size,
+                    available=available,
+                    rng=rng,
+                )
+
+                # Convert other iterable set-like results into an actual set.
+                generated_cluster = set(
+                    generated_cluster
+                )
+
+                # The cluster must contain exactly the requested number of
+                # cells. Undersized and oversized clusters are rejected.
+                if len(generated_cluster) != cluster_size:
+                    continue
+
+                # The custom generator may only use currently available cells.
+                # This prevents overlap and keeps clusters inside the disk.
+                if not generated_cluster.issubset(available):
+                    continue
+
+                # Require the requested seed to be part of the generated
+                # cluster so seed placement remains meaningful.
+                if seed not in generated_cluster:
+                    continue
+
+                placed_cluster = generated_cluster
+                break
+
+            if placed_cluster is None:
+                layout_complete = False
+                break
+
+            obstacles.update(placed_cluster)
+
+        # Preserve the largest valid partial layout found.
+        if len(obstacles) > len(best_obstacles):
+            best_obstacles = obstacles
+
+        if (
+            layout_complete
+            and len(obstacles) == placeable_count
+        ):
+            return obstacles
+
+    # If exclusions or limited geometry prevent a complete layout, return the
+    # largest valid collection of complete clusters found.
+    return best_obstacles
+
+
+register_obstacle_generator("clustered_n", gen_clustered_obstacles)
 
 # -----------------------------------------------------------------------------
 # Generator #2: fill all  (fill all hexes as obstacles in radius)
