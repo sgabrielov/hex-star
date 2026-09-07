@@ -400,7 +400,6 @@ def plot_hex_grid_2(
     return ax
 
 
-    return ax
 def plot_hex_grid(
     obstacles: Iterable[HexCoord],
     start: HexCoord,

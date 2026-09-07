@@ -1129,7 +1129,7 @@ def grow_blob_cluster(
     available: Set["HexCoord"],
     *,
     rng: random.Random,
-    max_radial_difference: int = 1,
+    max_radial_difference: int = 5,
 ) -> Set["HexCoord"]:
 
     if desired_size <= 0:

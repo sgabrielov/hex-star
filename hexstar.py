@@ -4,7 +4,6 @@ from typing import Iterable, Optional, Set, List, Tuple, Callable, Dict
 from queue import PriorityQueue
 from itertools import count
 from collections import defaultdict
-
 import math
 
 from dataclasses import dataclass
@@ -38,6 +37,7 @@ class HStarProblem:
         goal: HexCoord,
         a_max: float,  # maximum acceleration (for acceleration phase)
         a_min: float,  # maximum deceleration (positive value; used with sign as needed)
+        heuristic: Callable[["HStarProblem", "Node"], float],
         start_v: VelocityState = VelocityState(0, None),   # Start velocity
         goal_v: VelocityState = VelocityState(None, None) , # Target goal velocity for BiH*
         ay_window_ms: int = 1000,  # window for lateral acceleration averaging
@@ -60,7 +60,7 @@ class HStarProblem:
         self.search_direction = search_direction
         self.n_step = n_step
         self.epsilon = epsilon
-
+        self.heuristic = heuristic
         self.heuristic_consistent_flag = True
 
 
@@ -175,7 +175,12 @@ class HStarProblem:
     # Calculates the resulting node from applying action to node
     # Action is a hexcoord location returned by the actions function
     # Representing the destination location
-    def result(self, node: "Node", action: "HexCoord") -> "Node":
+    def result(
+        self,
+        node,
+        action,
+    ):
+
         new_branch = None
         # First, check if the next location is reachable given velocity and direction
         if self.ay_window_ms is not None and self.ay_window_ms > 0:
@@ -204,8 +209,10 @@ class HStarProblem:
             parent=parent,
             step_distance = s
         )
+
+        
         child.g_cost = parent.g_cost + t_step
-        child.h_cost = self.heuristic(self, child) if hasattr(self, "heuristic") and callable(self.heuristic) else h_cost_travel_time(self, child)
+        child.h_cost = self.heuristic(self, child)
         child.f_cost = f_cost(child.g_cost, child.h_cost)
         
         return child
@@ -354,6 +361,7 @@ class HStarProblem:
             jps_horizon=self.jps_horizon,
             n_step=self.n_step,
             search_direction="reverse",
+            heuristic=self.heuristic,
 
         )
 
@@ -415,7 +423,7 @@ class HStarProblem:
         t_step = travel_time_symmetric(start_node_copy.velocity.magnitude, start_node_copy.parent.velocity.magnitude, transition_distance)
         #t_step = travel_time_accel_limited(start_node_copy.velocity.magnitude, start_node_copy.parent.velocity.magnitude, transition_distance, self.a_max, self.a_min)
         start_node_copy.g_cost = start_node_copy.parent.g_cost + t_step
-        start_node_copy.h_cost = self.heuristic(self, start_node_copy) if hasattr(self, "heuristic") and callable(self.heuristic) else h_cost_travel_time(self, start_node_copy)
+        start_node_copy.h_cost = self.heuristic(self, start_node_copy) 
         start_node_copy.f_cost = f_cost(start_node_copy.g_cost, start_node_copy.h_cost)
     
         # Finally return this node
@@ -492,6 +500,7 @@ class HStarProblem:
         reverse_dir_vect = reverse_dir(dir_vect)
         reverse_dir_idx = self.DIRECTIONS.index(reverse_dir_vect)
         return reverse_dir_idx
+
 # ------------------------------
 # Geometry & kinematics utilities
 # ------------------------------
@@ -639,7 +648,7 @@ def construct_full_solution(solution):
         fsolution_path.extend([node.location])
 
     return fsolution_path
-    
+
 # ------------------------------
 # Cost functions (time-based)
 # ------------------------------
@@ -799,7 +808,29 @@ def f_cost(g: float, h: float) -> float:
 # --- Heuristic type alias ---
 HeuristicFn = Callable[["HStarProblem", "Node"], float]
 
-import time
+
+# Gives the bidirectional orchestrator access to newly accepted children without requiring it to reimplement how those children are accepted.
+@dataclass
+class SearchStepResult:
+    """
+    Result of advancing an HStarSearch by one popped frontier node.
+
+    popped_node:
+        The node removed from the priority queue.
+
+    accepted_children:
+        Generated children that passed the normal HStarSearch
+        dominance test and were inserted into the frontier.
+
+    goal_node:
+        The goal node when stop_at_goal=True and the popped node
+        satisfies the problem goal.
+    """
+    popped_node: Optional[Node] = None
+    accepted_children: Optional[List[Node]] = None
+    goal_node: Optional[Node] = None
+
+
 class HStarSearch:
     """
     A* framework specialized with H* time-based costs and hex-grid actions.
@@ -808,17 +839,14 @@ class HStarSearch:
     def __init__(
         self, 
         problem: HStarProblem, 
-        heuristic: Optional[HeuristicFn] = h_cost_travel_time,
     ) -> None:
         self.problem = problem
-        self.h: HeuristicFn = heuristic
-       
         self.open_set = PriorityQueue()
         self.closed_set: Dict[HexCoord] = {}
         self._counter = count()
 
         self.benchmarks = {
-            "states_reached": 0,
+            "nodes_reached": 0,
             "nodes_expanded": 0,
             "search_time": 0,
             "solution_cost": 0,
@@ -839,15 +867,15 @@ class HStarSearch:
             h_cost=0.0,
             f_cost=0.0,
         )
+        self.closed_set[
+            self._state_key(self.root)
+        ] = self.root
         # Seed costs
-        self.root.h_cost = self.h(self.problem, self.root)
+        self.root.h_cost = self.problem.heuristic(self.problem, self.root)
         self.root.f_cost = self.root.g_cost + self.root.h_cost
         
         self.open_set.put((self.root.f_cost, -next(self._counter), self.root))
         
-        closet_set_key = self.root.location
-        #closet_set_key = (self.root.location, self.root.velocity.direction)
-        self.closed_set[closet_set_key] = self.root
 
         self.open_set_sizes = []
         self.closed_set_sizes = []
@@ -859,7 +887,6 @@ class HStarSearch:
     def f(self, node):
         return node.g_cost + self.h(self.problem, node)
 
-    def reconstruct_path(self, node: Node) -> List[Node]:
         out: List[Node] = []
         cur = node
         while cur is not None:
@@ -870,38 +897,134 @@ class HStarSearch:
 
     def search(self) -> Optional[List[Node]]:
         start_time = time.time()
-        while not self.open_set.empty():
-            self.benchmarks['open_set_sizes'].append(self.open_set.qsize())
-            self.benchmarks['closed_set_sizes'].append(len(self.closed_set))
-            _, _, node = self.open_set.get(False)
-            self.benchmarks['nodes_expanded'] += 1
-            if self.problem.is_goal(node):
-                self.benchmarks['search_time'] = time.time() - start_time
-                node = self.problem.enforce_goal_velocity(node)
-                soln_path = self.reconstruct_path(node)
-                self.benchmarks['solution_cost'] = node.g_cost
-                self.benchmarks['solution_length'] = len(soln_path)
-                return soln_path
-            for child in self.expand(node):
-                s = child.location
-                #s = (child.location, child.velocity.direction)
-                prev_best = self.closed_set.get(s)
-                if prev_best is None or child.g_cost < prev_best.g_cost - 1e-12:
-                    self.closed_set[s] = child
-                    f = child.g_cost + self.h(self.problem, child)
-                    self.open_set.put((f, -next(self._counter), child))
-        return None  
     
-
+        while not self.open_set.empty():
+            step = self.advance(stop_at_goal=True)
+    
+            if step is None:
+                break
+    
+            if step.goal_node is not None:
+                solution_path = self.reconstruct_path(
+                    step.goal_node
+                )
+    
+                self.benchmarks["search_time"] = (
+                    time.time() - start_time
+                )
+                self.benchmarks["solution_cost"] = (
+                    step.goal_node.g_cost
+                )
+                self.benchmarks["solution_length"] = len(
+                    solution_path
+                )
+                
+                # Smoothness benchmarks
+                solution_locations = [node.location for node in solution_path]
+                
+                smoothness = calculate_path_smoothness(
+                    solution_locations,
+                    hex_size=self.problem.grid.hex_size,
+                )
+                
+                self.benchmarks["integrated_curvature_squared"] = (
+                    smoothness.integrated_curvature_squared
+                )
+                
+                self.benchmarks["total_absolute_curvature"] = (
+                    smoothness.total_absolute_curvature
+                )
+                
+                self.benchmarks["heading_changes"] = (
+                    smoothness.heading_changes
+                )
+                
+                self.benchmarks["minimum_turning_radius"] = (
+                    smoothness.minimum_turning_radius
+                )
+                return solution_path
+    
+        self.benchmarks["search_time"] = (
+            time.time() - start_time
+        )
+        self.benchmarks["solution_cost"] = None
+        self.benchmarks["solution_length"] = None
+    
+        return None
+    def _state_key(self, node: Node):
+        return (
+            node.location,
+            node.velocity.direction,
+        )     
+    def advance(
+        self,
+        stop_at_goal: bool = True,
+    ) -> Optional:
+        if self.open_set.empty():
+            return None
+    
+        self.benchmarks["open_set_sizes"].append(
+            self.open_set.qsize()
+        )
+        self.benchmarks["closed_set_sizes"].append(
+            len(self.closed_set)
+        )
+    
+        _, _, node = self.open_set.get(False)
+    
+        if stop_at_goal and self.problem.is_goal(node):
+            goal_node = self.problem.enforce_goal_velocity(node)
+    
+            return SearchStepResult(
+                popped_node=node,
+                accepted_children=[],
+                goal_node=goal_node,
+            )
+    
+        # Counts actual calls to expand().
+        self.benchmarks["nodes_expanded"] += 1
+    
+        accepted_children = []
+    
+        for child in self.expand(node):
+            state_key = self._state_key(child)
+            previous = self.closed_set.get(state_key)
+            
+            if (
+                previous is not None
+                and child.g_cost >= previous.g_cost - 1e-12
+            ):
+                continue
+            
+            self.closed_set[state_key] = child
+    
+            # Do not calculate h_cost again here.
+            self.open_set.put(
+                (
+                    child.f_cost,
+                    -next(self._counter),
+                    child,
+                )
+            )
+    
+            accepted_children.append(child)
+    
+        return SearchStepResult(
+            popped_node=node,
+            accepted_children=accepted_children,
+            goal_node=None,
+        )
     def expand(self, node):
-        children = []
-        for action in self.actions(node):
-            child = self.result(node, action)
-            self.benchmarks["states_reached"] += 1
-            if self.problem.heuristic_consistent_flag:
-                self.problem.heuristic_consistent_flag = self.check_h_consistency(self.problem, node, self.h)
-            children.append(child)
-        return children
+        for action in self.problem.actions(node):
+            child = self.problem.result(
+                node,
+                action,
+            )
+    
+            # result() has now evaluated h_cost and f_cost.
+            self.benchmarks["nodes_reached"] += 1
+    
+            yield child
 
 
     def actions(self, node):
@@ -927,7 +1050,20 @@ class HStarSearch:
                     # print(f'{hp} <= {ac} + {hn}  is false')
                     # print(node)
                     # print(node.parent)
-        return heuristic_is_consistent      
+        return heuristic_is_consistent 
+    def reconstruct_path(self, node: Node) -> list[Node]:
+        """
+        Reconstruct a path from the root to the supplied node by following
+    eferences.
+        """
+        path = []
+    
+        while node is not None:
+            path.append(node)
+            node = node.parent
+    
+        path.reverse()
+        return path     
     def get_benchmarks(self):
         return self.benchmarks
 
@@ -942,51 +1078,135 @@ class BidHStarSearch:
     def __init__(
         self,
         problem: HStarProblem,
-        heuristic: Optional[HeuristicFn] = h_cost_travel_time,
         join_tolerance: float = 1e-6,
         state_key_mode: str = "location",
         velocity_bin_size: float = 1.0,
         enable_benchmarking: bool = True,
         progress_every: Optional[int] = None,
         progress_top_k: int = 5,
+        bidirectional=True,
     ) -> None:
+        
         self.problem = problem
-        self.reverse_problem = problem.reverse()
-
-        self.forward_search = HStarSearch(problem, heuristic)
-        self.reverse_search = HStarSearch(self.reverse_problem, heuristic)
-
+        self.bidirectional = bidirectional
+        
+        self.forward_search = HStarSearch(
+            problem
+        )
+        
         self.join_tolerance = join_tolerance
-        self.heuristic = heuristic
-
         self.state_key_mode = state_key_mode
         self.velocity_bin_size = velocity_bin_size
-
         self.enable_benchmarking = enable_benchmarking
         self.progress_every = progress_every
         self.progress_top_k = progress_top_k
-
-        self.forward_reached_best: Dict[object, Node] = {}
-        self.reverse_reached_best: Dict[object, Node] = {}
-
-        self.forward_reached_best[self._state_key(self.forward_search.root)] = self.forward_search.root
-        self.reverse_reached_best[self._state_key(self.reverse_search.root)] = self.reverse_search.root
-
-        self.expand_forward_next = True 
+        
+        self.expand_forward_next = True
+        
+        if self.bidirectional:
+            self.reverse_problem = problem.reverse()
+        
+            self.reverse_search = HStarSearch(
+                self.reverse_problem
+            )
+        
+            self.forward_reached_best = {
+                self._state_key(self.forward_search.root):
+                    self.forward_search.root,
+            }
+        
+            self.reverse_reached_best = {
+                self._state_key(self.reverse_search.root):
+                    self.reverse_search.root,
+            }
+        else:
+            self.reverse_problem = None
+            self.reverse_search = None
+        
+            self.forward_reached_best = {}
+            self.reverse_reached_best = {}
         self.benchmarks = {
-            "states_reached": 0,
+            # Combined HStarSearch work
+            "nodes_reached": 0,
             "nodes_expanded": 0,
-            "search_time": 0,
-            "solution_cost": 0,
-            "solution_length": 0,
+        
+            # Direction-specific HStarSearch work
+            "forward_nodes_reached": 0,
+            "reverse_nodes_reached": 0,
+            "forward_nodes_expanded": 0,
+            "reverse_nodes_expanded": 0,
+        
+            # Search result
+            "search_time": 0.0,
+            "solution_cost": None,
+            "solution_length": None,
+            "solution_depth": None,
+            "effective_branching_factor": None,
+        
+            # Combined frontier history
             "open_set_sizes": [],
             "closed_set_sizes": [],
+        
+            # Direction-specific frontier history
+            "forward_open_set_sizes": [],
+            "reverse_open_set_sizes": [],
+            "forward_closed_set_sizes": [],
+            "reverse_closed_set_sizes": [],
+        
+            # Bidirectional orchestration
+            "iterations": 0,
             "join_checks": 0,
             "join_found": False,
-            "iterations": 0,
+            "meeting_location": None,
+        
+            # Optional diagnostic snapshots
             "progress_snapshots": [],
         }
-        
+    def _synchronize_bidirectional_benchmarks(self) -> None:
+        """
+        Copy authoritative metrics from the forward and reverse HStarSearch
+        objects into the combined BidHStarSearch benchmark dictionary.
+    
+        This method does not increment counters. It derives combined values
+        from the two underlying searches, preventing double counting.
+        """
+        if not self.bidirectional:
+            return
+    
+        forward = self.forward_search.get_benchmarks()
+        reverse = self.reverse_search.get_benchmarks()
+    
+        forward_reached = forward["nodes_reached"]
+        reverse_reached = reverse["nodes_reached"]
+    
+        forward_expanded = forward["nodes_expanded"]
+        reverse_expanded = reverse["nodes_expanded"]
+    
+        self.benchmarks["forward_nodes_reached"] = forward_reached
+        self.benchmarks["reverse_nodes_reached"] = reverse_reached
+        self.benchmarks["nodes_reached"] = (
+            forward_reached + reverse_reached
+        )
+    
+        self.benchmarks["forward_nodes_expanded"] = forward_expanded
+        self.benchmarks["reverse_nodes_expanded"] = reverse_expanded
+        self.benchmarks["nodes_expanded"] = (
+            forward_expanded + reverse_expanded
+        )
+    
+        self.benchmarks["forward_open_set_sizes"] = list(
+            forward["open_set_sizes"]
+        )
+        self.benchmarks["reverse_open_set_sizes"] = list(
+            reverse["open_set_sizes"]
+        )
+    
+        self.benchmarks["forward_closed_set_sizes"] = list(
+            forward["closed_set_sizes"]
+        )
+        self.benchmarks["reverse_closed_set_sizes"] = list(
+            reverse["closed_set_sizes"]
+        )    
     def _bench(self, key: str, value=1):
         if not self.enable_benchmarking:
             return
@@ -995,7 +1215,23 @@ class BidHStarSearch:
             self.benchmarks[key] += value
         else:
             self.benchmarks[key] = value
-
+    def get_benchmarks(self):
+        """
+        Return benchmarks for the active search mode.
+    
+        In unidirectional mode, forward_search is authoritative.
+    
+        In bidirectional mode:
+          - Forward and reverse HStarSearch objects are authoritative for
+            reached, expanded, and direction-specific frontier metrics.
+          - BidHStarSearch is authoritative for joins, iterations, combined
+            frontier histories, total time, and solution information.
+        """
+        if not self.bidirectional:
+            return self.forward_search.get_benchmarks()
+    
+        self._synchronize_bidirectional_benchmarks()
+        return self.benchmarks
     def _node_summary(self, node: Node) -> dict:
         return {
             "node": node,   # <-- keep original node reference
@@ -1104,20 +1340,6 @@ class BidHStarSearch:
     
         raise ValueError(f"Unknown state_key_mode: {self.state_key_mode}")
         
-    def _better_node(self, new_node: Node, old_node: Optional[Node]) -> bool:
-        if old_node is None:
-            return True
-    
-        eps = self.problem.epsilon
-    
-        if new_node.f_cost < old_node.f_cost - eps:
-            return True
-    
-        # optional tie-break: lower g_cost wins
-        if abs(new_node.f_cost - old_node.f_cost) <= eps and new_node.g_cost < old_node.g_cost - eps:
-            return True
-    
-        return False
 
     # ------------------------------------------------------------------
     # Join logic
@@ -1186,12 +1408,9 @@ class BidHStarSearch:
                 return None
             # print("repair success: REVERSE branch adjusted")
             # print(self._dbg_node_str("repaired_reverse_node", repaired_rev))
-            return fwd_node, repaired_rev
-            
+            return fwd_node, repaired_rev      
     def _try_join(self, child: Node, other: Node, expanding_forward: bool) -> Optional[JoinResult]:
-        if self.enable_benchmarking:
-            self.benchmarks["join_checks"] += 1
-    
+
         if expanding_forward:
             fwd_node, rev_node = child, other
         else:
@@ -1239,16 +1458,15 @@ class BidHStarSearch:
     
         if self.enable_benchmarking:
             self.benchmarks["join_found"] = True
-    
-        # print("[JOIN DEBUG] JOIN ACCEPTED")
-        # print("=" * 100)
-    
+            self.benchmarks["meeting_location"] = (
+                repaired_fwd.location
+            )
+        
         return JoinResult(
             forward_node=repaired_fwd,
             reverse_node=repaired_rev,
             meeting_location=repaired_fwd.location,
         )
-
 
     def stitch_joined_paths(self, join: JoinResult) -> List[Node]:
         fwd = self.reconstruct_path(join.forward_node)   # [start, ..., join]
@@ -1289,7 +1507,10 @@ class BidHStarSearch:
     # One expansion step on either frontier
     # ------------------------------------------------------------------
 
-    def _proceed_one_side(self, expanding_forward: bool) -> Optional[JoinResult]:
+    def _proceed_one_side(
+        self,
+        expanding_forward: bool,
+    ) -> Optional:
         if expanding_forward:
             search = self.forward_search
             reached_best = self.forward_reached_best
@@ -1299,39 +1520,31 @@ class BidHStarSearch:
             reached_best = self.reverse_reached_best
             other_reached_best = self.forward_reached_best
     
-        if search.open_set.empty():
+        step = search.advance(
+            stop_at_goal=False
+        )
+    
+        if step is None:
             return None
     
-        _, _, node = search.open_set.get(False)
-    
-        if self.enable_benchmarking:
-            self.benchmarks["nodes_expanded"] += 1
-    
-        for child in search.expand(node):
-            if self.enable_benchmarking:
-                self.benchmarks["states_reached"] += 1
-    
+        for child in step.accepted_children:
             state_key = self._state_key(child)
-            prev_best = reached_best.get(state_key)
+            reached_best[state_key] = child
     
-            if self._better_node(child, prev_best):
-                reached_best[state_key] = child
-                search.closed_set[state_key] = child
+            join_key = self._join_lookup_key(child)
+            other = other_reached_best.get(join_key)
     
-                f = child.g_cost + search.h(search.problem, child)
-                search.open_set.put((f, -next(search._counter), child))
+            if other is None:
+                continue
     
-                join_key = self._join_lookup_key(child)
-                other = other_reached_best.get(join_key)
+            join = self._try_join(
+                child=child,
+                other=other,
+                expanding_forward=expanding_forward,
+            )
     
-                if other is not None:
-                    join = self._try_join(
-                        child=child,
-                        other=other,
-                        expanding_forward=expanding_forward,
-                    )
-                    if join is not None:
-                        return join
+            if join is not None:
+                return join
     
         return None
     # ------------------------------------------------------------------
@@ -1455,66 +1668,129 @@ class BidHStarSearch:
         return f
 
     def search(self) -> Optional[List[Node]]:
+        if not self.bidirectional:
+            return self.forward_search.search()
+    
+        return self._search_bidirectional()
+          
+    def _search_bidirectional(
+        self,
+    ) -> Optional[List[Node]]:
         start_time = time.time()
     
-        while not self.forward_search.open_set.empty() and not self.reverse_search.open_set.empty():
+        while (
+            not self.forward_search.open_set.empty()
+            and not self.reverse_search.open_set.empty()
+        ):
             if self.enable_benchmarking:
                 self.benchmarks["iterations"] += 1
+    
                 self.benchmarks["open_set_sizes"].append(
-                    self.forward_search.open_set.qsize() + self.reverse_search.open_set.qsize()
+                    self.forward_search.open_set.qsize()
+                    + self.reverse_search.open_set.qsize()
                 )
+    
                 self.benchmarks["closed_set_sizes"].append(
-                    len(self.forward_search.closed_set) + len(self.reverse_search.closed_set)
+                    len(self.forward_search.closed_set)
+                    + len(self.reverse_search.closed_set)
                 )
+    
                 self._record_progress_snapshot()
     
-            # fwd_top = self._peek_f(self.forward_search)
-            # rev_top = self._peek_f(self.reverse_search)
-    
-            # if fwd_top <= rev_top:
-            #     join = self._proceed_one_side(expanding_forward=True)
-            # else:
-            #     join = self._proceed_one_side(expanding_forward=False)
             expanding_forward = self.expand_forward_next
             self.expand_forward_next = not self.expand_forward_next
-            
+    
             join = self._proceed_one_side(
                 expanding_forward=expanding_forward
             )
+    
+            # A successful join must be handled immediately.
             if join is not None:
                 path = self.stitch_joined_paths(join)
-            
+    
                 if self.enable_benchmarking:
+                    self._synchronize_bidirectional_benchmarks()
+    
                     search_time = time.time() - start_time
-            
-                    solution_length = len(path) if path else 0
+                    solution_length = len(path)
                     solution_depth = max(solution_length - 1, 0)
-            
-                    nodes_expanded = self.benchmarks.get("nodes_expanded", 0)
-            
-                    nodes_for_ebf = nodes_expanded + 1
-            
+                    nodes_expanded = self.benchmarks["nodes_expanded"]
+    
                     self.benchmarks["search_time"] = search_time
-                    self.benchmarks["solution_cost"] = path[-1].g_cost if path else 0
-                    self.benchmarks["solution_length"] = solution_length
-                    self.benchmarks["solution_depth"] = solution_depth
-                    self.benchmarks["effective_branching_factor"] = effective_branching_factor(
-                        nodes=nodes_for_ebf,
-                        depth=solution_depth
+                    self.benchmarks["solution_cost"] = (
+                        path[-1].g_cost
                     )
-            
+                    self.benchmarks["solution_length"] = (
+                        solution_length
+                    )
+                    self.benchmarks["solution_depth"] = (
+                        solution_depth
+                    )
+                    self.benchmarks["meeting_location"] = (
+                        join.meeting_location
+                    )
+    
+                    self.benchmarks[
+                        "effective_branching_factor"
+                    ] = effective_branching_factor(
+                        nodes=nodes_expanded + 1,
+                        depth=solution_depth,
+                    )
+                    solution_locations = [node.location for node in path]
+                    
+                    smoothness = calculate_path_smoothness(
+                        solution_locations,
+                        hex_size=self.problem.grid.hex_size,
+                    )
+                    
+                    self.benchmarks["integrated_curvature_squared"] = (
+                        smoothness.integrated_curvature_squared
+                    )
+                    
+                    self.benchmarks["total_absolute_curvature"] = (
+                        smoothness.total_absolute_curvature
+                    )
+                    
+                    self.benchmarks["heading_changes"] = (
+                        smoothness.heading_changes
+                    )
+                    
+                    self.benchmarks["minimum_turning_radius"] = (
+                        smoothness.minimum_turning_radius
+                    )
+    
                 return path
-
+    
+        # One of the frontiers was exhausted without finding a join.
         if self.enable_benchmarking:
-            self.benchmarks["search_time"] = time.time() - start_time
+            self._synchronize_bidirectional_benchmarks()
+    
+            self.benchmarks["search_time"] = (
+                time.time() - start_time
+            )
             self.benchmarks["solution_cost"] = None
             self.benchmarks["solution_length"] = None
             self.benchmarks["solution_depth"] = None
-            self.benchmarks["effective_branching_factor"] = None
-        
+            self.benchmarks[
+                "effective_branching_factor"
+            ] = None
+    
         return None
-
+ 
+        
     def get_benchmarks(self):
+        """
+        Return benchmarks for the active search mode.
+    
+        Unidirectional mode delegates the search to forward_search, so its
+        benchmark dictionary is authoritative.
+    
+        Bidirectional mode is orchestrated by this class, so the combined
+        benchmark dictionary is authoritative.
+        """
+        if not self.bidirectional:
+            return self.forward_search.get_benchmarks()
+    
         return self.benchmarks
 
 # ------------------------------
@@ -1535,9 +1811,6 @@ def velocity_stddev(path: List[Node]) -> Tuple[float, float]:
     pass
 
 
-# ------------------------------------------------------------------
-# Benchmarking Helpers
-# ------------------------------------------------------------------
 # ------------------------------------------------------------------
 # Benchmarking Helpers
 # ------------------------------------------------------------------
@@ -1644,3 +1917,434 @@ def effective_branching_factor(nodes, depth, tolerance=0.000001, max_iter=100):
             high = mid
 
     return (low + high) / 2.0
+
+
+
+@dataclass(frozen=True)
+class PathSmoothnessMetrics:
+    """
+    Geometry-only smoothness metrics for a path.
+
+    Lower is smoother:
+        integrated_curvature_squared
+        total_absolute_curvature
+        heading_changes
+
+    Higher is smoother:
+        minimum_turning_radius
+
+    minimum_turning_radius is math.inf for a completely straight path.
+    """
+    integrated_curvature_squared: float
+    total_absolute_curvature: float
+    heading_changes: int
+    minimum_turning_radius: float
+
+
+def axial_to_cartesian(
+    coord: HexCoord,
+    hex_size: float = 1.0,
+) -> Tuple[float, float]:
+    """
+    Convert a pointy-top axial hex coordinate to the Cartesian coordinates
+    of the hex center.
+
+    For adjacent axial cells, the center-to-center distance is:
+
+        sqrt(3) * hex_size
+
+    Parameters
+    ----------
+    coord:
+        Axial HexCoord(q, r).
+    hex_size:
+        Hexagon radius, meaning center-to-corner distance.
+
+    Returns
+    -------
+    tuple[float, float]
+        Cartesian coordinates (x, y).
+    """
+    x = math.sqrt(3.0) * hex_size * (coord.q + coord.r / 2.0)
+    y = 1.5 * hex_size * coord.r
+
+    return x, y
+
+
+def _prepare_path_points(
+    path: Iterable[HexCoord],
+    hex_size: float = 1.0,
+    epsilon: float = 1e-12,
+) -> List[Tuple[float, float]]:
+    """
+    Convert an axial-coordinate path to Cartesian points and remove
+    consecutive duplicate locations.
+
+    Only consecutive duplicates are removed. If a path leaves a location
+    and later returns to it, the later occurrence remains part of the path.
+    """
+    if hex_size <= 0:
+        raise ValueError("hex_size must be greater than zero")
+
+    points = []
+
+    for coord in path:
+        point = axial_to_cartesian(coord, hex_size)
+
+        if not points:
+            points.append(point)
+            continue
+
+        dx = point[0] - points[-1][0]
+        dy = point[1] - points[-1][1]
+
+        if math.hypot(dx, dy) > epsilon:
+            points.append(point)
+
+    return points
+
+
+def _signed_turn_angle(
+    a: Tuple[float, float],
+    b: Tuple[float, float],
+    c: Tuple[float, float],
+) -> float:
+    """
+    Return the signed heading change at point b in radians.
+
+    Positive:
+        Counterclockwise turn.
+
+    Negative:
+        Clockwise turn.
+
+    Range:
+        [-pi, pi]
+    """
+    incoming_x = b[0] - a[0]
+    incoming_y = b[1] - a[1]
+
+    outgoing_x = c[0] - b[0]
+    outgoing_y = c[1] - b[1]
+
+    cross = incoming_x * outgoing_y - incoming_y * outgoing_x
+    dot = incoming_x * outgoing_x + incoming_y * outgoing_y
+
+    return math.atan2(cross, dot)
+
+
+def integrated_curvature_squared(
+    path: Iterable[HexCoord],
+    hex_size: float = 1.0,
+    epsilon: float = 1e-12,
+) -> float:
+    r"""
+    Approximate the integrated squared curvature:
+
+        ICS = integral(kappa(s)^2 ds)
+
+    For a discrete polyline, curvature at interior vertex i is estimated as:
+
+        kappa_i = delta_theta_i / delta_s_i
+
+    where:
+
+        delta_s_i = (length_in_i + length_out_i) / 2
+
+    Therefore:
+
+        ICS approximately equals sum(delta_theta_i^2 / delta_s_i)
+
+    Interpretation
+    --------------
+    Lower values indicate smoother paths.
+
+    This metric penalizes sharp, spatially concentrated turns more strongly
+    than gradual turns distributed across a longer distance.
+
+    Units
+    -----
+    1 / distance
+
+    If hex_size is measured in meters, the result is in 1/meters.
+    """
+    points = _prepare_path_points(path, hex_size, epsilon)
+
+    if len(points) < 3:
+        return 0.0
+
+    total = 0.0
+
+    for i in range(1, len(points) - 1):
+        a = points[i - 1]
+        b = points[i]
+        c = points[i + 1]
+
+        length_in = math.hypot(
+            b[0] - a[0],
+            b[1] - a[1],
+        )
+        length_out = math.hypot(
+            c[0] - b[0],
+            c[1] - b[1],
+        )
+
+        local_arc_length = 0.5 * (length_in + length_out)
+
+        if local_arc_length <= epsilon:
+            continue
+
+        turn_angle = _signed_turn_angle(a, b, c)
+
+        total += (turn_angle * turn_angle) / local_arc_length
+
+    return total
+
+
+def total_absolute_curvature(
+    path: Iterable[HexCoord],
+    hex_size: float = 1.0,
+    epsilon: float = 1e-12,
+) -> float:
+    r"""
+    Compute the total absolute heading change:
+
+        TAC = sum(abs(delta_theta_i))
+
+    This is the discrete equivalent of:
+
+        integral(abs(kappa(s)) ds)
+
+    Interpretation
+    --------------
+    Lower values indicate less total turning.
+
+    Unlike integrated curvature squared, this metric does not strongly
+    distinguish between one concentrated turn and the same total turn
+    distributed across multiple smaller turns.
+
+    Units
+    -----
+    Radians
+    """
+    points = _prepare_path_points(path, hex_size, epsilon)
+
+    if len(points) < 3:
+        return 0.0
+
+    total = 0.0
+
+    for i in range(1, len(points) - 1):
+        turn_angle = _signed_turn_angle(
+            points[i - 1],
+            points[i],
+            points[i + 1],
+        )
+
+        if abs(turn_angle) > epsilon:
+            total += abs(turn_angle)
+
+    return total
+
+
+def count_heading_changes(
+    path: Iterable[HexCoord],
+    minimum_turn_angle: float = 1e-9,
+    hex_size: float = 1.0,
+    epsilon: float = 1e-12,
+) -> int:
+    """
+    Count the number of interior path vertices whose heading change is at
+    least minimum_turn_angle.
+
+    Parameters
+    ----------
+    path:
+        Ordered axial HexCoord locations.
+    minimum_turn_angle:
+        Minimum absolute heading difference, in radians, that is counted
+        as a turn.
+    hex_size:
+        Hexagon radius. This does not affect the angle, but it is included
+        for interface consistency.
+    epsilon:
+        Numerical tolerance used when removing duplicate points.
+
+    Returns
+    -------
+    int
+        Number of detected heading changes.
+    """
+    if minimum_turn_angle < 0:
+        raise ValueError("minimum_turn_angle cannot be negative")
+
+    points = _prepare_path_points(path, hex_size, epsilon)
+
+    if len(points) < 3:
+        return 0
+
+    count = 0
+
+    for i in range(1, len(points) - 1):
+        turn_angle = abs(
+            _signed_turn_angle(
+                points[i - 1],
+                points[i],
+                points[i + 1],
+            )
+        )
+
+        if turn_angle >= minimum_turn_angle:
+            count += 1
+
+    return count
+
+
+def _circumradius(
+    a: Tuple[float, float],
+    b: Tuple[float, float],
+    c: Tuple[float, float],
+    epsilon: float = 1e-12,
+) -> float:
+    """
+    Return the radius of the circle passing through a, b, and c.
+
+    Returns math.inf when the three points are collinear or nearly
+    collinear.
+    """
+    side_ab = math.hypot(
+        b[0] - a[0],
+        b[1] - a[1],
+    )
+    side_bc = math.hypot(
+        c[0] - b[0],
+        c[1] - b[1],
+    )
+    side_ca = math.hypot(
+        a[0] - c[0],
+        a[1] - c[1],
+    )
+
+    twice_area = abs(
+        (b[0] - a[0]) * (c[1] - a[1])
+        - (b[1] - a[1]) * (c[0] - a[0])
+    )
+
+    if twice_area <= epsilon:
+        return math.inf
+
+    # R = abc / (4A)
+    # Since twice_area = 2A:
+    # R = abc / (2 * twice_area)
+    return (
+        side_ab * side_bc * side_ca
+        / (2.0 * twice_area)
+    )
+
+
+def minimum_turning_radius(
+    path: Iterable[HexCoord],
+    hex_size: float = 1.0,
+    minimum_turn_angle: float = 1e-9,
+    epsilon: float = 1e-12,
+) -> float:
+    """
+    Estimate the minimum local turning radius along the path.
+
+    At each actual turn, the local radius is estimated as the circumradius
+    of three consecutive Cartesian path locations.
+
+    Interpretation
+    --------------
+    Higher values indicate gentler turns.
+
+    A completely straight path returns math.inf because its geometric
+    turning radius is infinite.
+
+    Units
+    -----
+    Same distance unit as hex_size.
+    """
+    if minimum_turn_angle < 0:
+        raise ValueError("minimum_turn_angle cannot be negative")
+
+    points = _prepare_path_points(path, hex_size, epsilon)
+
+    if len(points) < 3:
+        return math.inf
+
+    radii = []
+
+    for i in range(1, len(points) - 1):
+        a = points[i - 1]
+        b = points[i]
+        c = points[i + 1]
+
+        turn_angle = abs(_signed_turn_angle(a, b, c))
+
+        if turn_angle < minimum_turn_angle:
+            continue
+
+        radius = _circumradius(a, b, c, epsilon)
+
+        if math.isfinite(radius):
+            radii.append(radius)
+
+    if not radii:
+        return math.inf
+
+    return min(radii)
+
+
+def calculate_path_smoothness(
+    path: Iterable[HexCoord],
+    hex_size: float = 1.0,
+    minimum_turn_angle: float = 1e-9,
+    epsilon: float = 1e-12,
+) -> PathSmoothnessMetrics:
+    """
+    Calculate all four geometry-only path smoothness metrics.
+
+    Parameters
+    ----------
+    path:
+        Ordered HexCoord locations defining the solution path.
+    hex_size:
+        Center-to-corner hex radius.
+    minimum_turn_angle:
+        Minimum heading change, in radians, counted as an actual turn.
+    epsilon:
+        Numerical tolerance.
+
+    Returns
+    -------
+    PathSmoothnessMetrics
+        All four smoothness measurements.
+    """
+    # Materialize once because the input may be a generator.
+    locations = list(path)
+
+    return PathSmoothnessMetrics(
+        integrated_curvature_squared=integrated_curvature_squared(
+            locations,
+            hex_size=hex_size,
+            epsilon=epsilon,
+        ),
+        total_absolute_curvature=total_absolute_curvature(
+            locations,
+            hex_size=hex_size,
+            epsilon=epsilon,
+        ),
+        heading_changes=count_heading_changes(
+            locations,
+            minimum_turn_angle=minimum_turn_angle,
+            hex_size=hex_size,
+            epsilon=epsilon,
+        ),
+        minimum_turning_radius=minimum_turning_radius(
+            locations,
+            hex_size=hex_size,
+            minimum_turn_angle=minimum_turn_angle,
+            epsilon=epsilon,
+        ),
+    )
