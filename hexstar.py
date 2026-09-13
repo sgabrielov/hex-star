@@ -784,13 +784,23 @@ def g_cost(problem: HStarProblem, node: Node) -> float:
 #     goal_v = problem.goal_v.magnitude
 #     return travel_time_accel_limited(u, goal_v, distance, a, a2)
     
-def h_cost_travel_time(problem: HStarProblem, node: Node) -> float:
+def h_cost_travel_time_manhattan(problem: HStarProblem, node: Node) -> float:
     """
     Heuristic: estimated time from node to goal assuming highest safe velocity
     and straight-line (manhattan) hex distance.
     """
     steps = hex_manhattan_distance(node.location, problem.goal)
     distance = steps * hex_step_distance(problem.grid.hex_size)
+    a = abs(problem.a_max)
+    u = node.velocity.magnitude
+    return travel_time(u,a,distance)
+
+def h_cost_travel_time_euclidian(problem: HStarProblem, node: Node) -> float:
+    """
+    Heuristic: estimated time from node to goal assuming highest safe velocity
+    and straight-line (euclidian) hex distance.
+    """
+    distance = euclid_center_distance(node.location, problem.goal, problem.hex_size)
     a = abs(problem.a_max)
     u = node.velocity.magnitude
     return travel_time(u,a,distance)

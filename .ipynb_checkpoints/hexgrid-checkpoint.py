@@ -664,7 +664,7 @@ def totient(n: int) -> int:
     return result
     
 def value_at_index(x: int) -> int:
-    """y(x) = 6 * sum_{k=1..x} φ(k), with y(0)=0."""
+    """y(x) = sum_{k=1..x} φ(k), with y(0)=0."""
     if x < 0:
         raise ValueError("x must be non-negative")
     s = 0
@@ -706,13 +706,26 @@ def axial_to_xy(coord: HexCoord, hex_size: float = 1.0) -> Tuple[float, float]:
     y = 1.5 * hex_size * r
     return (x, y)
 
-def euclid_center_distance(a: HexCoord, b: HexCoord, *, hex_size: float = 1.0) -> float:
+def euclid_center_distance_old(a: HexCoord, b: HexCoord, *, hex_size: float = 1.0) -> float:
     """
     Euclidean distance between the centers of two hexes (pointy-top axial grid).
     """
     ax, ay = axial_to_xy(a, hex_size=hex_size)
     bx, by = axial_to_xy(b, hex_size=hex_size)
     return math.hypot(ax - bx, ay - by)
+
+
+def euclid_center_distance(
+    a: HexCoord,
+    b: HexCoord,
+    hex_size: float = 1.0,
+) -> float:
+    dq = b.q - a.q
+    dr = b.r - a.r
+
+    return hex_size * math.sqrt(
+        3.0 * (dq*dq + dq*dr + dr*dr)
+    )
     
 def angle_abc(a: HexCoord, b: HexCoord, c: HexCoord, *,
               hex_size: float = 1.0,

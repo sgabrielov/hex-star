@@ -110,6 +110,9 @@ def plot_hex_grid_2(
     hex_size: float = 1.0,
     goal: Optional[HexCoord] = None,
     path: Optional[Iterable[HexCoord] | Mapping[HexCoord, float]] = None,
+    cell_styles: Optional[
+        Mapping[HexCoord, tuple[str, str]]
+    ] = None,
     ax: Optional[plt.Axes] = None,
     figsize: tuple = (8, 8),
     # ---- Labels & colors ----
@@ -185,6 +188,26 @@ def plot_hex_grid_2(
         return {cell: 1.0 for cell in path_obj}
 
     obstacle_set = set(obstacles or [])
+    cell_styles = dict(cell_styles or {})
+    
+    for cell, style in cell_styles.items():
+        if not isinstance(style, tuple) or len(style) != 2:
+            raise ValueError(
+                "Each cell_styles value must be a "
+                "(color, legend_label) tuple."
+            )
+    
+        color, label = style
+    
+        if not mcolors.is_color_like(color):
+            raise ValueError(
+                f"Invalid color {color!r} for cell {cell!r}."
+            )
+    
+        if not isinstance(label, str):
+            raise ValueError(
+                f"Legend label for cell {cell!r} must be a string."
+            )
     path_alpha = _normalize_path_alpha(path)
     path_set = set(path_alpha.keys())
 
@@ -229,7 +252,11 @@ def plot_hex_grid_2(
         polys.append(poly)
 
         # --- Main cell face color ---
-        if cell == start:
+        # Custom cell styles take precedence over standard colors.
+        if cell in cell_styles:
+            custom_color, _ = cell_styles[cell]
+            colors.append(custom_color)
+        elif cell == start:
             colors.append(facecolor_start)
         elif goal is not None and cell == goal:
             colors.append(facecolor_goal)
@@ -239,7 +266,13 @@ def plot_hex_grid_2(
             colors.append(facecolor_free)
 
         # --- Path overlay with alpha from dict/set ---
-        if cell in path_set and cell not in obstacle_set and cell != start and cell != goal:
+        if (
+            cell in path_set
+            and cell not in cell_styles
+            and cell not in obstacle_set
+            and cell != start
+            and cell != goal
+        ):
             alpha = path_alpha[cell]
             path_polys.append(path_template + center_xy)
             path_facecolors.append((*path_rgb, alpha))
@@ -311,83 +344,231 @@ def plot_hex_grid_2(
         ax.set_title(
             f"{plt_title}"
         )
-
     # ---- Corner-anchored axis arrows ----
     if draw_axes:
-        xmin, xmax = ax.get_xlim()
-        ymin, ymax = ax.get_ylim()
-
-        if axis_corner == "upper right":
-            anchor_x, anchor_y = xmax - margin * 0.5, ymax - margin * 0.5
-            ha_q, va_q = "right", "top"
-            ha_r, va_r = "right", "top"
-        elif axis_corner == "upper left":
-            anchor_x, anchor_y = xmin + margin * 0.5, ymax - margin * 0.5
-            ha_q, va_q = "left", "top"
-            ha_r, va_r = "left", "top"
-        elif axis_corner == "lower left":
-            anchor_x, anchor_y = xmin + margin * 0.5, ymin + margin * 0.5
-            ha_q, va_q = "left", "bottom"
-            ha_r, va_r = "left", "bottom"
+        # Positions and lengths are in axes-relative coordinates, so the
+        # indicator remains inside the frame regardless of grid dimensions.
+        axis_length = 0.10
+        inset = 0.035
+        label_offset = 0.018
+    
+        if axis_corner == "lower left":
+            anchor_x, anchor_y = inset, inset
+            x_sign, y_sign = 1.0, 1.0
+    
         elif axis_corner == "lower right":
-            anchor_x, anchor_y = xmax - margin * 0.5, ymin + margin * 0.5
-            ha_q, va_q = "right", "bottom"
-            ha_r, va_r = "right", "bottom"
+            anchor_x, anchor_y = 1.0 - inset, inset
+            x_sign, y_sign = -1.0, 1.0
+    
+        elif axis_corner == "upper left":
+            anchor_x, anchor_y = inset, 1.0 - inset
+            x_sign, y_sign = 1.0, -1.0
+    
+        elif axis_corner == "upper right":
+            anchor_x, anchor_y = 1.0 - inset, 1.0 - inset
+            x_sign, y_sign = -1.0, -1.0
+    
         else:
             raise ValueError(
-                "axis_corner must be one of: upper right, upper left, lower left, lower right"
+                "axis_corner must be one of: "
+                "upper right, upper left, lower left, lower right"
             )
-
-        q_unit_dx, q_unit_dy = axial_to_xy(1, 0, hex_size)
-        r_unit_dx, r_unit_dy = axial_to_xy(0, 1, hex_size)
-
-        scale = max(2, radius // 3)
-
-        ax.arrow(
-            anchor_x, anchor_y,
-            q_unit_dx * scale, q_unit_dy * scale,
-            head_width=0.4 * hex_size, head_length=0.6 * hex_size,
-            length_includes_head=True,
-            fc=q_color, ec=q_color, lw=2.0, zorder=4,
+    
+        # q-axis is horizontal.
+        q_dx = x_sign * axis_length
+        q_dy = 0.0
+    
+        # r-axis is angled at 60 degrees.
+        r_dx = x_sign * axis_length * 0.5
+        r_dy = y_sign * axis_length * np.sqrt(3) / 2
+    
+        # Draw q-axis.
+        ax.annotate(
+            "",
+            xy=(anchor_x + q_dx, anchor_y + q_dy),
+            xytext=(anchor_x, anchor_y),
+            xycoords=ax.transAxes,
+            textcoords=ax.transAxes,
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": q_color,
+                "linewidth": 2.0,
+                "mutation_scale": 12,
+                "shrinkA": 0,
+                "shrinkB": 0,
+            },
+            annotation_clip=False,
+            zorder=4,
         )
-        ax.arrow(
-            anchor_x, anchor_y,
-            r_unit_dx * scale, r_unit_dy * scale,
-            head_width=0.4 * hex_size, head_length=0.6 * hex_size,
-            length_includes_head=True,
-            fc=r_color, ec=r_color, lw=2.0, zorder=4,
+    
+        # Draw r-axis.
+        ax.annotate(
+            "",
+            xy=(anchor_x + r_dx, anchor_y + r_dy),
+            xytext=(anchor_x, anchor_y),
+            xycoords=ax.transAxes,
+            textcoords=ax.transAxes,
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": r_color,
+                "linewidth": 2.0,
+                "mutation_scale": 12,
+                "shrinkA": 0,
+                "shrinkB": 0,
+            },
+            annotation_clip=False,
+            zorder=4,
         )
-
+    
+        # Horizontal alignment points labels inward from the arrow tips.
+        label_ha = "left" if x_sign > 0 else "right"
+    
+        # Vertical alignment points labels inward from the top/bottom edge.
+        label_va = "bottom" if y_sign > 0 else "top"
+    
+        # q-axis label.
         ax.text(
-            anchor_x + q_unit_dx * (scale + 0.2),
-            anchor_y + q_unit_dy * (scale + 0.2),
-            "q-axis", color=q_color, fontsize=9, fontweight="bold",
-            ha=ha_q, va=va_q, zorder=5,
+            anchor_x + q_dx + x_sign * label_offset,
+            anchor_y + q_dy,
+            "q-axis",
+            transform=ax.transAxes,
+            color=q_color,
+            fontsize=9,
+            fontweight="bold",
+            ha=label_ha,
+            va="center",
+            clip_on=False,
+            zorder=5,
         )
+    
+        # r-axis label.
         ax.text(
-            anchor_x + r_unit_dx * (scale + 0.2),
-            anchor_y + r_unit_dy * (scale + 0.2),
-            "r-axis", color=r_color, fontsize=9, fontweight="bold",
-            ha=ha_r, va=va_r, zorder=5,
+            anchor_x + r_dx + x_sign * label_offset,
+            anchor_y + r_dy + y_sign * label_offset,
+            "r-axis",
+            transform=ax.transAxes,
+            color=r_color,
+            fontsize=9,
+            fontweight="bold",
+            ha=label_ha,
+            va=label_va,
+            clip_on=False,
+            zorder=5,
         )
-
+    custom_legend_handles = []
+    seen_custom_styles = set()
+    
+    for color, label in cell_styles.values():
+        style_key = (
+            mcolors.to_hex(color).lower(),
+            label,
+        )
+    
+        if style_key in seen_custom_styles:
+            continue
+    
+        seen_custom_styles.add(style_key)
+    
+        custom_legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=color,
+                marker="h",
+                linestyle="none",
+                markersize=9,
+                markerfacecolor=color,
+                markeredgecolor=edgecolor,
+                label=label,
+            )
+        )
     # ---- Legend ----
     if show_axis_legend:
-        legend_handles = [
-            Line2D([0], [0], color=q_color, lw=3, label="q-axis (axial)"),
-            Line2D([0], [0], color=r_color, lw=3, label="r-axis (axial)"),
-            Line2D([0], [0], color=edgecolor, lw=1, label="cell boundary"),
-            Line2D([0], [0], color=facecolor_obstacle, lw=0, marker="s", markersize=8,
-                   label="obstacle", markerfacecolor=facecolor_obstacle),
-            Line2D([0], [0], color=facecolor_start, lw=0, marker="s", markersize=8,
-                   label="start", markerfacecolor=facecolor_start),
-            Line2D([0], [0], color=facecolor_goal, lw=0, marker="s", markersize=8,
-                   label="goal", markerfacecolor=facecolor_goal),
-            Line2D([0], [0], color=facecolor_path, lw=0, marker="s", markersize=8,
-                   label="path overlay", markerfacecolor=facecolor_path),
-        ]
-        ax.legend(handles=legend_handles, loc="upper right", frameon=True, fontsize=8)
+        legend_handles = []
 
+        # Include axis entries only when the axes are drawn.
+        if draw_axes:
+            legend_handles.extend([
+                Line2D(
+                    [0], [0],
+                    color=q_color,
+                    lw=3,
+                    label="q-axis (axial)",
+                ),
+                Line2D(
+                    [0], [0],
+                    color=r_color,
+                    lw=3,
+                    label="r-axis (axial)",
+                ),
+            ])
+
+        legend_handles.extend([
+            Line2D(
+                [0], [0],
+                color=edgecolor,
+                lw=1,
+                label="cell boundary",
+            ),
+            Line2D(
+                [0], [0],
+                color=facecolor_obstacle,
+                lw=0,
+                marker="h",
+                markersize=9,
+                label="obstacle",
+                markerfacecolor=facecolor_obstacle,
+                markeredgecolor=edgecolor,
+            ),
+            Line2D(
+                [0], [0],
+                color=facecolor_start,
+                lw=0,
+                marker="h",
+                markersize=9,
+                label="start",
+                markerfacecolor=facecolor_start,
+                markeredgecolor=edgecolor,
+            ),
+        ])
+
+        # Include the goal only when one was supplied.
+        if goal is not None:
+            legend_handles.append(
+                Line2D(
+                    [0], [0],
+                    color=facecolor_goal,
+                    lw=0,
+                    marker="h",
+                    markersize=9,
+                    label="goal",
+                    markerfacecolor=facecolor_goal,
+                    markeredgecolor=edgecolor,
+                )
+            )
+
+        if path_set:
+            legend_handles.append(
+                Line2D(
+                    [0], [0],
+                    color=facecolor_path,
+                    lw=0,
+                    marker="h",
+                    markersize=9,
+                    label="add to open set", # "path overlay",
+                    markerfacecolor=facecolor_path,
+                    markeredgecolor="none",
+                )
+            )
+
+        legend_handles.extend(custom_legend_handles)
+
+        ax.legend(
+            handles=legend_handles,
+            loc="upper right",
+            frameon=True,
+            fontsize=8,
+        )
     if created_fig:
         plt.tight_layout()
     
