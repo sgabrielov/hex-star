@@ -45,6 +45,7 @@ class Node:
     g_cost: float = 0.0  # actual travel time accumulated
     h_cost: float = 0.0  # heuristic travel time
     f_cost: float = 0.0  # total estimated cost
+    
 @dataclass(frozen=True)
 class RLState:
     location: HexCoord
@@ -78,10 +79,14 @@ class HexGrid:
         self,
         hex_size: float,
         obstacles: Optional[Dict[HexCoord, bool]] = None,
+        center: Optional[HexCoord] = HexCoord(0,0),
+        radius: Optional[int] = 15,
         allowed: Optional[Set[HexCoord]] = None,  
     ) -> None:
         self.hex_size = hex_size
         self.obstacles = obstacles or {}
+        self.center = center
+        self.radius = radius
         self.allowed = allowed  # None => unbounded
 
     def is_blocked(self, coord: HexCoord) -> bool:

@@ -1,6 +1,6 @@
 from hexgrid import RLState, HexCoord, VelocityState, Node, HexGrid, get_neighbors_at_radius, add_coords, get_direction, get_direction_ray, get_path_direction, hex_step_distance, idx_to_step, build_obstacle_map, get_available_nodes_in_dir, hex_segment_between, angle_abc, hdist, unique_direction_vectors_up_to_n, euclid_center_distance, hexes_in_between_solid, value_at_index, circular_slice, gcd_reduce
 from hexgeometry import reverse_dir
-from hexstarrl import Experience, ReplayBuffer, ValueNetwork, ExperienceCollector
+from hexstarrl import Experience, ReplayBuffer, ValueNetwork_DNN, ValueNetwork_HUNet, ExperienceCollector
 from typing import Iterable, Optional, Set, List, Tuple, Callable, Dict
 from queue import PriorityQueue
 from itertools import count
@@ -847,9 +847,15 @@ def h_cost_travel_time_euclidean(problem: HStarProblem, node: Node) -> float:
     Heuristic: estimated time from node to goal assuming highest safe velocity
     and straight-line (euclidian) hex distance.
     """
-    distance = euclid_center_distance(node.location, problem.goal, problem.grid.hex_size)
-    a = abs(problem.a_max)
-    u = node.velocity.magnitude
+
+    return travel_time_euclidean(node.location, problem.goal, node.velocity.magnitude, problem.a_max, problem.grid.hex_size)
+
+def travel_time_euclidean(h1:HexCoord, h2:HexCoord, u:int, a:int, hex_size:int) -> float:
+    """
+    Heuristic: estimated time from node to goal assuming highest safe velocity
+    and straight-line (euclidian) hex distance.
+    """
+    distance = euclid_center_distance(h1, h2, hex_size)
     return travel_time(u,a,distance)
     
 def f_cost(g: float, h: float) -> float:
