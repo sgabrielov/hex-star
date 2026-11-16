@@ -21,7 +21,9 @@ import torch
 import torch.nn as nn
 
 
-from hexgrid import RLState, euclid_center_distance
+from hexgrid import RLState, euclid_center_distance, VelocityState
+from collections import defaultdict
+
 
 from unet.hexunet_model import HexUNet
 
@@ -73,6 +75,13 @@ class Experience:
     cost: float
     next_state: Any
     terminal: bool
+
+@dataclass(frozen=True)
+class SolutionTarget:
+    state: RLState
+    goal: RLState
+    environment_id: int
+    target: float
 
 # buffer = ReplayBuffer()
 # if buffer is not none:
@@ -150,49 +159,239 @@ class ValueNetwork_DNN(nn.Module):
 
         return value.item()
 
+# class ValueNetwork_HUNet(nn.Module):
+
+#     def __init__(
+#         self,
+#         encoder: StateEncoder,
+#         spatial_channels=16,
+#         kinematic_features=5,
+#     ):
+#         super().__init__()
+
+#         self.encoder = encoder
+
+#         self.hunet = HexUNet(
+#             n_channels=3,
+#             n_classes=spatial_channels,
+#         )
+
+#         self.network = nn.Sequential(
+#             nn.Linear(
+#                 spatial_channels + kinematic_features,
+#                 64,
+#             ),
+#             nn.ReLU(),
+#             nn.Linear(64, 64),
+#             nn.ReLU(),
+#             nn.Linear(64, 1),
+#             nn.Softplus(),
+#         )
+
+#     def forward(
+#         self,
+#         spatial_features,
+#         kinematic_features,
+#     ):
+#         x = torch.cat(
+#             [
+#                 spatial_features,
+#                 kinematic_features,
+#             ],
+#             dim=1,
+#         )
+
+#         return self.network(x)
+
+#     def value(
+#         self,
+#         problem,
+#         state: RLState,
+#         goal: RLState,
+#         environment,
+#         feature_map=None,
+#     ):
+#         if feature_map is None:
+#             feature_map = self.encode_environment(
+#                 environment,
+#                 goal,
+#             )
+    
+#         row, col = self.encoder.location_index(
+#             state,
+#             environment.center,
+#             environment.radius,
+#         )
+    
+#         spatial_features = feature_map[
+#             :,
+#             :,
+#             row,
+#             col,
+#         ]
+    
+#         kinematic_features = self.encoder.encode_state(
+#             problem,
+#             state,
+#             goal,
+#         )
+    
+#         kinematic_features = torch.tensor(
+#             kinematic_features,
+#             dtype=torch.float32,
+#         ).unsqueeze(0)
+    
+#         return self.forward(
+#             spatial_features,
+#             kinematic_features,
+#         )
+
+#     def predict(
+#         self,
+#         problem,
+#         state: RLState,
+#         goal: RLState,
+#         environment,
+#         feature_map=None,
+#     ) -> float:
+#         with torch.no_grad():
+#             value = self.value(
+#                 problem,
+#                 state,
+#                 goal,
+#                 environment,
+#                 feature_map=feature_map,
+#             )
+    
+#         return value.item()
+#     def encode_environment(
+#         self,
+#         environment,
+#         goal: RLState,
+#     ):
+#         """Generate the HexUNet feature map for one environment and goal."""
+    
+#         spatial_input = self.encoder.encode_spatial(
+#             environment,
+#             goal,
+#             environment.center,
+#             environment.radius,
+#         )
+    
+#         spatial_input = spatial_input.unsqueeze(0)
+    
+#         return self.hunet(spatial_input)
 class ValueNetwork_HUNet(nn.Module):
+    """
+    Estimate cost-to-go J(state, goal).
+
+    HexUNet produces a spatial context vector for every hex.
+    The context vector at the current state's location is combined
+    with relative position, velocity, and direction and passed
+    through an MLP.
+    """
 
     def __init__(
         self,
-        encoder: StateEncoder,
+        encoder,
         spatial_channels=16,
-        kinematic_features=5,
+        state_features=5,
     ):
         super().__init__()
 
         self.encoder = encoder
+        self.spatial_channels = spatial_channels
+        self.state_features = state_features
 
+        # Environmental/spatial encoder:
+        #   goal
+        #   obstacles
+        #   valid-hex mask
         self.hunet = HexUNet(
-            n_channels=2,
+            n_channels=3,
             n_classes=spatial_channels,
         )
 
+        # Context vector + state vector -> scalar cost-to-go
         self.network = nn.Sequential(
             nn.Linear(
-                spatial_channels + kinematic_features,
+                spatial_channels + state_features,
                 64,
             ),
             nn.ReLU(),
+
             nn.Linear(64, 64),
             nn.ReLU(),
+
             nn.Linear(64, 1),
             nn.Softplus(),
         )
 
     def forward(
         self,
-        spatial_features,
-        kinematic_features,
+        context,
+        state_features,
     ):
         x = torch.cat(
             [
-                spatial_features,
-                kinematic_features,
+                context,
+                state_features,
             ],
-            dim=1,
+            dim=-1,
         )
 
         return self.network(x)
+
+    def encode_environment(
+        self,
+        environment,
+        goal,
+    ):
+        """
+        Produce one context vector per spatial location.
+
+        Returns:
+            [1, spatial_channels, H, W]
+        """
+
+        spatial_input = self.encoder.encode_spatial(
+            environment,
+            goal.location,
+            environment.center,
+            environment.radius,
+        )
+
+        spatial_input = spatial_input.unsqueeze(0)
+
+        return self.hunet(spatial_input)
+
+    def encode_state(
+        self,
+        state,
+        goal,
+    ):
+        dq = state.location.q - goal.location.q
+        dr = state.location.r - goal.location.r
+    
+        velocity = state.velocity.magnitude
+    
+        if state.velocity.direction is None:
+            direction_q = 0.0
+            direction_r = 0.0
+        else:
+            direction_q = state.velocity.direction.q
+            direction_r = state.velocity.direction.r
+    
+        return torch.tensor(
+            [
+                dq,
+                dr,
+                velocity,
+                direction_q,
+                direction_r,
+            ],
+            dtype=torch.float32,
+        )
 
     def value(
         self,
@@ -200,47 +399,58 @@ class ValueNetwork_HUNet(nn.Module):
         state,
         goal,
         environment,
+        context_map=None,
     ):
-        spatial_input = self.encoder.encode_spatial(
-            environment,
-            goal,
-            environment.center,
-            environment.radius,
-        ).unsqueeze(0)
+        """
+        Return differentiable scalar value for one state.
+        """
 
-        feature_map = self.hunet(
-            spatial_input
+        if context_map is None:
+            context_map = self.encode_environment(
+                environment,
+                goal,
+            )
+
+        center = environment.center
+        radius = environment.radius
+
+        row = (
+            state.location.r
+            - center.r
+            + radius
         )
 
-        
-        row, col = self.encoder.location_index(
-            state,
-            environment.center,
-            environment.radius,
+        col = (
+            state.location.q
+            - center.q
+            + radius
         )
 
-        spatial_features = feature_map[
+        # [1, C]
+        context = context_map[
             :,
             :,
             row,
             col,
         ]
 
-        kinematic_features = self.encoder.encode_state(
-            problem,
+        state_features = self.encode_state(
             state,
             goal,
         )
 
-        kinematic_features = torch.tensor(
-            kinematic_features,
-            dtype=torch.float32,
-        ).unsqueeze(0)
-
-        return self.forward(
-            spatial_features,
-            kinematic_features,
+        state_features = (
+            state_features
+            .to(context.device)
+            .unsqueeze(0)
         )
+
+        value = self.forward(
+            context,
+            state_features,
+        )
+
+        return value.squeeze()
 
     def predict(
         self,
@@ -248,34 +458,24 @@ class ValueNetwork_HUNet(nn.Module):
         state,
         goal,
         environment,
+        context_map=None,
     ):
+        """
+        Inference convenience function.
+        """
+
+        self.eval()
+
         with torch.no_grad():
             value = self.value(
-                problem,
-                state,
-                goal,
-                environment,
+                problem=problem,
+                state=state,
+                goal=goal,
+                environment=environment,
+                context_map=context_map,
             )
 
         return value.item()
-    def encode_environment(
-        self,
-        environment,
-        goal: RLState,
-    ):
-        """Generate the HexUNet feature map for one environment and goal."""
-    
-        spatial_input = self.encoder.encode_spatial(
-            environment,
-            goal,
-            environment.center,
-            environment.radius,
-        )
-    
-        spatial_input = spatial_input.unsqueeze(0)
-    
-        return self.hunet(spatial_input)
-        
 class ExperienceCollector:
     """Convert transitions generated by H*/HEX* into replay experience.
 
@@ -299,30 +499,90 @@ class ExperienceCollector:
         environment_id: int,
     ) -> Experience:
         """Record one parent -> child transition."""
-
+    
+        def to_rl_velocity(velocity):
+            direction = (
+                None
+                if velocity.direction is None
+                else problem.DIRECTIONS[velocity.direction]
+            )
+    
+            return VelocityState(
+                magnitude=velocity.magnitude,
+                direction=direction,
+            )
+    
         experience = Experience(
             state=RLState(
                 location=parent.location,
-                velocity=parent.velocity,
+                velocity=to_rl_velocity(parent.velocity),
             ),
             goal=RLState(
                 location=problem.goal,
-                velocity=problem.goal_v,
+                velocity=to_rl_velocity(problem.goal_v),
             ),
             environment_id=environment_id,
             action=action,
             cost=child.g_cost - parent.g_cost,
             next_state=RLState(
                 location=child.location,
-                velocity=child.velocity,
+                velocity=to_rl_velocity(child.velocity),
             ),
             terminal=problem.is_goal(child),
         )
-
+    
         self.replay_buffer.add(experience)
-
+    
         return experience
 
+    def observe_solution(
+        self,
+        problem,
+        solution_path,
+        environment_id,
+    ):
+        """Create supervised value targets from a completed solution path."""
+    
+        solution_cost = solution_path[-1].g_cost
+    
+        def to_rl_velocity(velocity):
+            direction = (
+                None
+                if velocity.direction is None
+                else problem.DIRECTIONS[velocity.direction]
+            )
+    
+            return VelocityState(
+                magnitude=velocity.magnitude,
+                direction=direction,
+            )
+    
+        goal = RLState(
+            location=problem.goal,
+            velocity=to_rl_velocity(problem.goal_v),
+        )
+    
+        targets = []
+    
+        for node in solution_path:
+    
+            state = RLState(
+                location=node.location,
+                velocity=to_rl_velocity(node.velocity),
+            )
+    
+            target = solution_cost - node.g_cost
+    
+            targets.append(
+                SolutionTarget(
+                    state=state,
+                    goal=goal,
+                    environment_id=environment_id,
+                    target=target,
+                )
+            )
+    
+        return targets
 class StateEncoder:
     """Convert an Experience into numeric model input features."""
 
@@ -400,15 +660,15 @@ class HUNetStateEncoder(StateEncoder):
         size = 2 * radius + 1
 
         x = torch.zeros(
-            2,
+            3,
             size,
             size,
             dtype=torch.float32,
         )
 
         # Channel 0 = goal
-        goal_row = goal.location.r - center.r + radius
-        goal_col = goal.location.q - center.q + radius
+        goal_row = goal.r - center.r + radius
+        goal_col = goal.q - center.q + radius
 
         x[0, goal_row, goal_col] = 1.0
 
@@ -422,7 +682,10 @@ class HUNetStateEncoder(StateEncoder):
                 and 0 <= col < size
             ):
                 x[1, row, col] = 1.0
-
+        x[2] = make_valid_hex_mask(
+            radius=radius,
+            center=center,
+        )
         return x
 
     def encode_state(
@@ -714,6 +977,47 @@ class HUNetTDTrainer(TDTrainer):
             "mean_prediction": predictions.mean().item(),
             "mean_target": targets.mean().item(),
         }
+
+    def train_solution(
+        self,
+        problem,
+        solution_targets,
+    ):
+        if not solution_targets:
+            return 0.0
+    
+        losses = []
+    
+        for sample in solution_targets:
+    
+            environment = self.environment_store.get(
+                sample.environment_id
+            )
+    
+            prediction = self.model.value(
+                problem=problem,
+                state=sample.state,
+                goal=sample.goal,
+                environment=environment,
+            )
+    
+            target = torch.tensor(
+                sample.target,
+                dtype=torch.float32,
+                device=prediction.device,
+            )
+    
+            losses.append(
+                (prediction - target).pow(2)
+            )
+    
+        loss = torch.stack(losses).mean()
+    
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+    
+        return loss.item()
 class EnvironmentStore:
     """Store environments separately from Experience objects."""
 
@@ -773,3 +1077,107 @@ def get_kinematic_features(
         ]],
         dtype=torch.float32,
     )
+
+def make_valid_hex_mask(
+    radius: int,
+    center: HexCoord,
+):
+    size = 2 * radius + 1
+
+    mask = torch.zeros(
+        (size, size),
+        dtype=torch.float32,
+    )
+
+    for row in range(size):
+        for col in range(size):
+
+            q = center.q + col - radius
+            r = center.r + row - radius
+
+            dq = q - center.q
+            dr = r - center.r
+
+            distance = max(
+                abs(dq),
+                abs(dr),
+                abs(dq + dr),
+            )
+
+            if distance <= radius:
+                mask[row, col] = 1.0
+
+    return mask
+
+def make_solution_target_map(
+    solution_path,
+    center,
+    radius,
+):
+    size = 2 * radius + 1
+
+    target_map = torch.zeros(
+        (size, size),
+        dtype=torch.float32,
+    )
+
+    target_mask = torch.zeros(
+        (size, size),
+        dtype=torch.bool,
+    )
+
+    solution_cost = solution_path[-1].g_cost
+
+    for node in solution_path:
+        row = node.location.r - center.r + radius
+        col = node.location.q - center.q + radius
+
+        target_map[row, col] = (
+            solution_cost - node.g_cost
+        )
+
+        target_mask[row, col] = True
+
+    return target_map, target_mask
+
+def masked_mse_loss(
+    prediction,
+    target,
+    mask,
+):
+    prediction = prediction[0, 0]
+
+    error = (
+        prediction - target
+    ).pow(2)
+
+    return error[mask].mean()
+
+
+def group_experiences_by_state(
+    experiences,
+):
+    groups = defaultdict(list)
+
+    for exp in experiences:
+
+        direction = exp.state.velocity.direction
+
+        key = (
+            exp.environment_id,
+
+            exp.goal.location.q,
+            exp.goal.location.r,
+
+            exp.state.location.q,
+            exp.state.location.r,
+
+            exp.state.velocity.magnitude,
+
+            None if direction is None else direction.q,
+            None if direction is None else direction.r,
+        )
+
+        groups[key].append(exp)
+
+    return groups

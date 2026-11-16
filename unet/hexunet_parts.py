@@ -214,7 +214,14 @@ class HConv2d(nn.Conv2d):
             groups=self.groups,
         )
 
+class HOutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = HConv2d(in_channels, out_channels, kernel_size=1, padding=0)
 
+    def forward(self, x):
+        return self.conv(x)
+        
 #### Utilities
 ### Hex mask generator
 ### Generates a mask given a kernel size
@@ -319,10 +326,4 @@ def h_upsample2d(x, scale_factor=2):
     )
 
 
-class HOutConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = HConv2d(in_channels, out_channels, kernel_size=1, padding=0)
 
-    def forward(self, x):
-        return self.conv(x)
