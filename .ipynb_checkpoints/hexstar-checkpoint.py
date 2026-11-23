@@ -1,6 +1,15 @@
 from hexgrid import RLState, HexCoord, VelocityState, Node, HexGrid, get_neighbors_at_radius, add_coords, get_direction, get_direction_ray, get_path_direction, hex_step_distance, idx_to_step, build_obstacle_map, get_available_nodes_in_dir, hex_segment_between, angle_abc, hdist, unique_direction_vectors_up_to_n, euclid_center_distance, hexes_in_between_solid, value_at_index, circular_slice, gcd_reduce
 from hexgeometry import reverse_dir
-from hexstarrl import Experience, ReplayBuffer, ValueNetwork_DNN, ValueNetwork_HUNet, ExperienceCollector
+
+from hexstarrl import (
+    Experience,
+    ReplayBuffer,
+    ValueNetwork_DNN,
+    ValueNetwork_HUNet,
+    ExperienceCollector,
+    HUNetTDTrainer,
+)
+
 from typing import Iterable, Optional, Set, List, Tuple, Callable, Dict
 from queue import PriorityQueue
 from itertools import count
@@ -983,6 +992,13 @@ class HStarSearch:
                 solution_path = self.reconstruct_path(
                     step.goal_node
                 )
+
+                if self.experience_collector is not None:
+                    self.experience_collector.observe_solution(
+                        problem=self.problem,
+                        solution_path=solution_path,
+                        environment_id=self.environment_id,
+                    )
     
                 self.benchmarks["search_time"] = (
                     time.time() - start_time
@@ -1168,15 +1184,36 @@ class BidHStarSearch:
         progress_every: Optional[int] = None,
         progress_top_k: int = 5,
         bidirectional=True,
-        experience_collector: Optional[ExperienceCollector] = None,
+        experience_collector: Optional[
+            ExperienceCollector
+        ] = None,
         environment_id: Optional[int] = None,
+        online_trainer: Optional[
+            HUNetTDTrainer
+        ] = None,
+        online_batch_size: int = 16,
+        online_training_steps: int = 1,
     ) -> None:
         
         self.problem = problem
         self.bidirectional = bidirectional
         self.environment_id = environment_id
-        # RL Stores the expanded states with their f,g,h costs
+                
         self.experience_collector = experience_collector
+        self.online_trainer = online_trainer
+        
+        if (
+            online_trainer is not None
+            and experience_collector is None
+        ):
+            raise ValueError(
+                "online_trainer requires an "
+                "experience_collector"
+            )
+        
+        self.online_batch_size = online_batch_size
+        self.online_training_steps = online_training_steps
+
         self.forward_search = HStarSearch(
             problem,
             experience_collector=experience_collector,
@@ -1253,6 +1290,11 @@ class BidHStarSearch:
         
             # Optional diagnostic snapshots
             "progress_snapshots": [],
+
+            # RL Benchmarks
+            "online_training_steps": 0,
+            "online_training_history": [],
+            "online_last_metrics": None,
         }
     def _synchronize_bidirectional_benchmarks(self) -> None:
         """
@@ -1298,7 +1340,34 @@ class BidHStarSearch:
         )
         self.benchmarks["reverse_closed_set_sizes"] = list(
             reverse["closed_set_sizes"]
-        )    
+        )  
+    def _synchronize_unidirectional_benchmarks(self):
+        """
+        Copy metrics produced by forward HStarSearch into the unified
+        BidHStarSearch benchmark dictionary.
+        """
+    
+        forward = self.forward_search.get_benchmarks()
+    
+        for key, value in forward.items():
+            self.benchmarks[key] = value
+    
+        self.benchmarks["forward_nodes_reached"] = (
+            forward["nodes_reached"]
+        )
+    
+        self.benchmarks["forward_nodes_expanded"] = (
+            forward["nodes_expanded"]
+        )
+    
+        self.benchmarks["forward_open_set_sizes"] = list(
+            forward["open_set_sizes"]
+        )
+    
+        self.benchmarks["forward_closed_set_sizes"] = list(
+            forward["closed_set_sizes"]
+        )
+
     def _bench(self, key: str, value=1):
         if not self.enable_benchmarking:
             return
@@ -1309,21 +1378,20 @@ class BidHStarSearch:
             self.benchmarks[key] = value
     def get_benchmarks(self):
         """
-        Return benchmarks for the active search mode.
+        Return the unified BidHStarSearch benchmark dictionary.
     
-        In unidirectional mode, forward_search is authoritative.
-    
-        In bidirectional mode:
-          - Forward and reverse HStarSearch objects are authoritative for
-            reached, expanded, and direction-specific frontier metrics.
-          - BidHStarSearch is authoritative for joins, iterations, combined
-            frontier histories, total time, and solution information.
+        BidHStarSearch is always the public authority for benchmarks,
+        regardless of whether the actual search is unidirectional or
+        bidirectional.
         """
-        if not self.bidirectional:
-            return self.forward_search.get_benchmarks()
     
-        self._synchronize_bidirectional_benchmarks()
+        if self.bidirectional:
+            self._synchronize_bidirectional_benchmarks()
+        else:
+            self._synchronize_unidirectional_benchmarks()
+    
         return self.benchmarks
+        
     def _node_summary(self, node: Node) -> dict:
         return {
             "node": node,   # <-- keep original node reference
@@ -1748,7 +1816,63 @@ class BidHStarSearch:
         print("=" * 100)
 
 
+    # ------------------------------------------------------------------
+    # RL Helpers
+    # ------------------------------------------------------------------
 
+    def _train_online(
+        self,
+        problem,
+    ):
+        if self.online_trainer is None:
+            return
+    
+        replay_buffer = (
+            self.experience_collector.replay_buffer
+        )
+    
+        if not replay_buffer.has_training_batch(
+            batch_size=self.online_batch_size,
+            solution_weight=self.online_trainer.solution_weight,
+            nonterminal_weight=self.online_trainer.nonterminal_weight,
+        ):
+            return
+    
+        for _ in range(self.online_training_steps):
+    
+            metrics = self.online_trainer.train_step(
+                problem=problem,
+                batch_size=self.online_batch_size,
+            )
+    
+            self.benchmarks[
+                "online_training_history"
+            ].append(metrics)
+    
+            self.benchmarks[
+                "online_training_steps"
+            ] += 1
+    
+            self.benchmarks[
+                "online_last_metrics"
+            ] = metrics
+        return metrics
+        
+    def _record_solution_targets(
+        self,
+        path,
+    ):
+        if self.experience_collector is None:
+            return []
+    
+        if not self.bidirectional:
+            return []
+    
+        return self.experience_collector.observe_solution(
+            problem=self.problem,
+            solution_path=path,
+            environment_id=self.environment_id,
+        )
     # ------------------------------------------------------------------
     # Main search loop
     # ------------------------------------------------------------------
@@ -1759,11 +1883,30 @@ class BidHStarSearch:
         f, _, _ = search.open_set.queue[0]
         return f
 
-    def search(self) -> Optional[List[Node]]:
-        if not self.bidirectional:
-            return self.forward_search.search()
+    def search(
+        self,
+    ) -> Optional[List[Node]]:
     
-        return self._search_bidirectional()
+        if not self.bidirectional:
+            path = self.forward_search.search()
+    
+            self._synchronize_unidirectional_benchmarks()
+    
+        else:
+            path = self._search_bidirectional()
+    
+            self._synchronize_bidirectional_benchmarks()
+    
+        if path is not None:
+            self._record_solution_targets(
+                path
+            )
+    
+        self._train_online(
+            problem=self.problem
+        )
+    
+        return path
           
     def _search_bidirectional(
         self,
@@ -1870,20 +2013,6 @@ class BidHStarSearch:
         return None
  
         
-    def get_benchmarks(self):
-        """
-        Return benchmarks for the active search mode.
-    
-        Unidirectional mode delegates the search to forward_search, so its
-        benchmark dictionary is authoritative.
-    
-        Bidirectional mode is orchestrated by this class, so the combined
-        benchmark dictionary is authoritative.
-        """
-        if not self.bidirectional:
-            return self.forward_search.get_benchmarks()
-    
-        return self.benchmarks
 
 # ------------------------------
 # Optional helpers for velocity statistics/smoothness analysis

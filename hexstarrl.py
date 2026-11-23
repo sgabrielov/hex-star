@@ -87,33 +87,229 @@ class SolutionTarget:
 # if buffer is not none:
 #     process experience
 
+# class ReplayBuffer:
+#     """Store transition experience for minibatch training."""
+
+#     def __init__(self, capacity: int = 100_000) -> None:
+#         if capacity <= 0:
+#             raise ValueError("capacity must be positive")
+#         self._items: Deque[Experience] = deque(maxlen=capacity)
+
+#     def add(self, experience: Experience) -> None:
+#         """Add one observed transition to the replay buffer."""
+#         self._items.append(experience)
+
+#     def extend(self, experiences: Iterable[Experience]) -> None:
+#         """Add several observed transitions."""
+#         self._items.extend(experiences)
+
+#     def sample(self, batch_size: int):
+#         """Return a random minibatch of stored transitions."""
+#         return random.sample(
+#             list(self._items),
+#             min(batch_size, len(self._items))
+#         )
+
+#     def __len__(self) -> int:
+#         return len(self._items)
+
 class ReplayBuffer:
-    """Store transition experience for minibatch training."""
+    """Store transition and grounded solution experience."""
 
-    def __init__(self, capacity: int = 100_000) -> None:
+    def __init__(
+        self,
+        capacity=2_000_000,
+        solution_fraction=0.20,
+    ):
         if capacity <= 0:
-            raise ValueError("capacity must be positive")
-        self._items: Deque[Experience] = deque(maxlen=capacity)
+            raise ValueError(
+                "capacity must be positive"
+            )
 
-    def add(self, experience: Experience) -> None:
-        """Add one observed transition to the replay buffer."""
-        self._items.append(experience)
+        if not 0.0 <= solution_fraction <= 1.0:
+            raise ValueError(
+                "solution_fraction must be between 0 and 1"
+            )
 
-    def extend(self, experiences: Iterable[Experience]) -> None:
-        """Add several observed transitions."""
-        self._items.extend(experiences)
+        self.capacity = capacity
+        self.solution_fraction = solution_fraction
 
-    def sample(self, batch_size: int):
-        """Return a random minibatch of stored transitions."""
-        return random.sample(
-            list(self._items),
-            min(batch_size, len(self._items))
+        self.solution_capacity = round(
+            capacity * solution_fraction
         )
 
-    def __len__(self) -> int:
+        self.nonterminal_capacity = (
+            capacity - self.solution_capacity
+        )
+
+        self._solution_items = deque(
+            maxlen=self.solution_capacity
+        )
+
+        self._items = deque(
+            maxlen=self.nonterminal_capacity
+        )
+
+    # -------------------------
+    # Nonterminal experience
+    # -------------------------
+
+    def add(
+        self,
+        experience: Experience,
+    ):
+        self._items.append(
+            experience
+        )
+
+    def extend(
+        self,
+        experiences,
+    ):
+        self._items.extend(
+            experiences
+        )
+
+    def sample(
+        self,
+        batch_size,
+    ):
+        return random.sample(
+            list(self._items),
+            min(
+                batch_size,
+                len(self._items),
+            ),
+        )
+
+    # -------------------------
+    # Grounded solution data
+    # -------------------------
+
+    def add_solution(
+        self,
+        target: SolutionTarget,
+    ):
+        self._solution_items.append(
+            target
+        )
+
+    def extend_solution(
+        self,
+        targets,
+    ):
+        self._solution_items.extend(
+            targets
+        )
+
+    def sample_solution(
+        self,
+        batch_size,
+    ):
+        return random.sample(
+            list(self._solution_items),
+            min(
+                batch_size,
+                len(self._solution_items),
+            ),
+        )
+
+    # -------------------------
+    # Mixed sampling
+    # -------------------------
+
+    def sample_mixed(
+        self,
+        batch_size,
+        solution_weight=1.0,
+        nonterminal_weight=0.0,
+    ):
+        total_weight = (
+            solution_weight
+            + nonterminal_weight
+        )
+
+        if total_weight <= 0:
+            raise ValueError(
+                "At least one weight must be positive"
+            )
+
+        solution_count = round(
+            batch_size
+            * solution_weight
+            / total_weight
+        )
+
+        nonterminal_count = (
+            batch_size - solution_count
+        )
+
+        solution_samples = random.sample(
+            list(self._solution_items),
+            min(
+                solution_count,
+                len(self._solution_items),
+            ),
+        )
+
+        nonterminal_samples = random.sample(
+            list(self._items),
+            min(
+                nonterminal_count,
+                len(self._items),
+            ),
+        )
+
+        return (
+            solution_samples,
+            nonterminal_samples,
+        )
+
+    # -------------------------
+    # Status
+    # -------------------------
+    def has_training_batch(
+        self,
+        batch_size,
+        solution_weight=1.0,
+        nonterminal_weight=0.0,
+    ):
+        total_rate = (
+            solution_weight
+            + nonterminal_weight
+        )
+    
+        if total_rate <= 0:
+            return False
+    
+        solution_count = round(
+            batch_size
+            * solution_weight
+            / total_rate
+        )
+    
+        td_count = (
+            batch_size
+            - solution_count
+        )
+    
+        return (
+            len(self._solution_items) >= solution_count
+            and len(self._items) >= td_count
+        )
+    @property
+    def solution_size(self):
+        return len(self._solution_items)
+
+    @property
+    def nonterminal_size(self):
         return len(self._items)
 
-   
+    def __len__(self):
+        return (
+            len(self._solution_items)
+            + len(self._items)
+        )
 class ValueNetwork_DNN(nn.Module):
     """Basic neural network for estimating cost-to-go J(state, goal)."""
 
@@ -159,128 +355,6 @@ class ValueNetwork_DNN(nn.Module):
 
         return value.item()
 
-# class ValueNetwork_HUNet(nn.Module):
-
-#     def __init__(
-#         self,
-#         encoder: StateEncoder,
-#         spatial_channels=16,
-#         kinematic_features=5,
-#     ):
-#         super().__init__()
-
-#         self.encoder = encoder
-
-#         self.hunet = HexUNet(
-#             n_channels=3,
-#             n_classes=spatial_channels,
-#         )
-
-#         self.network = nn.Sequential(
-#             nn.Linear(
-#                 spatial_channels + kinematic_features,
-#                 64,
-#             ),
-#             nn.ReLU(),
-#             nn.Linear(64, 64),
-#             nn.ReLU(),
-#             nn.Linear(64, 1),
-#             nn.Softplus(),
-#         )
-
-#     def forward(
-#         self,
-#         spatial_features,
-#         kinematic_features,
-#     ):
-#         x = torch.cat(
-#             [
-#                 spatial_features,
-#                 kinematic_features,
-#             ],
-#             dim=1,
-#         )
-
-#         return self.network(x)
-
-#     def value(
-#         self,
-#         problem,
-#         state: RLState,
-#         goal: RLState,
-#         environment,
-#         feature_map=None,
-#     ):
-#         if feature_map is None:
-#             feature_map = self.encode_environment(
-#                 environment,
-#                 goal,
-#             )
-    
-#         row, col = self.encoder.location_index(
-#             state,
-#             environment.center,
-#             environment.radius,
-#         )
-    
-#         spatial_features = feature_map[
-#             :,
-#             :,
-#             row,
-#             col,
-#         ]
-    
-#         kinematic_features = self.encoder.encode_state(
-#             problem,
-#             state,
-#             goal,
-#         )
-    
-#         kinematic_features = torch.tensor(
-#             kinematic_features,
-#             dtype=torch.float32,
-#         ).unsqueeze(0)
-    
-#         return self.forward(
-#             spatial_features,
-#             kinematic_features,
-#         )
-
-#     def predict(
-#         self,
-#         problem,
-#         state: RLState,
-#         goal: RLState,
-#         environment,
-#         feature_map=None,
-#     ) -> float:
-#         with torch.no_grad():
-#             value = self.value(
-#                 problem,
-#                 state,
-#                 goal,
-#                 environment,
-#                 feature_map=feature_map,
-#             )
-    
-#         return value.item()
-#     def encode_environment(
-#         self,
-#         environment,
-#         goal: RLState,
-#     ):
-#         """Generate the HexUNet feature map for one environment and goal."""
-    
-#         spatial_input = self.encoder.encode_spatial(
-#             environment,
-#             goal,
-#             environment.center,
-#             environment.radius,
-#         )
-    
-#         spatial_input = spatial_input.unsqueeze(0)
-    
-#         return self.hunet(spatial_input)
 class ValueNetwork_HUNet(nn.Module):
     """
     Estimate cost-to-go J(state, goal).
@@ -458,10 +532,10 @@ class ValueNetwork_HUNet(nn.Module):
             col,
         ]
 
-        state_features = self.encode_state(
+        state_features = self.encoder.encode_state(
             state,
             goal,
-            environment,
+            environment.radius,
         )
 
         state_features = (
@@ -525,33 +599,22 @@ class ExperienceCollector:
     ) -> Experience:
         """Record one parent -> child transition."""
     
-        def to_rl_velocity(velocity):
-            direction = (
-                None
-                if velocity.direction is None
-                else problem.DIRECTIONS[velocity.direction]
-            )
-    
-            return VelocityState(
-                magnitude=velocity.magnitude,
-                direction=direction,
-            )
-    
+
         experience = Experience(
             state=RLState(
                 location=parent.location,
-                velocity=to_rl_velocity(parent.velocity),
+                velocity=_to_rl_velocity(problem, parent.velocity),
             ),
             goal=RLState(
                 location=problem.goal,
-                velocity=to_rl_velocity(problem.goal_v),
+                velocity=_to_rl_velocity(problem, problem.goal_v),
             ),
             environment_id=environment_id,
             action=action,
             cost=child.g_cost - parent.g_cost,
             next_state=RLState(
                 location=child.location,
-                velocity=to_rl_velocity(child.velocity),
+                velocity=_to_rl_velocity(problem, child.velocity),
             ),
             terminal=problem.is_goal(child),
         )
@@ -559,32 +622,22 @@ class ExperienceCollector:
         self.replay_buffer.add(experience)
     
         return experience
-
     def observe_solution(
         self,
         problem,
         solution_path,
         environment_id,
     ):
-        """Create supervised value targets from a completed solution path."""
+        """Convert a successful solution path into grounded targets and store them."""
+    
+        if not solution_path:
+            return []
     
         solution_cost = solution_path[-1].g_cost
     
-        def to_rl_velocity(velocity):
-            direction = (
-                None
-                if velocity.direction is None
-                else problem.DIRECTIONS[velocity.direction]
-            )
-    
-            return VelocityState(
-                magnitude=velocity.magnitude,
-                direction=direction,
-            )
-    
         goal = RLState(
             location=problem.goal,
-            velocity=to_rl_velocity(problem.goal_v),
+            velocity=_to_rl_velocity(problem, problem.goal_v),
         )
     
         targets = []
@@ -593,7 +646,7 @@ class ExperienceCollector:
     
             state = RLState(
                 location=node.location,
-                velocity=to_rl_velocity(node.velocity),
+                velocity=_to_rl_velocity(problem, node.velocity),
             )
     
             target = solution_cost - node.g_cost
@@ -606,6 +659,10 @@ class ExperienceCollector:
                     target=target,
                 )
             )
+    
+        self.replay_buffer.extend_solution(
+            targets
+        )
     
         return targets
 class StateEncoder:
@@ -715,38 +772,48 @@ class HUNetStateEncoder(StateEncoder):
 
     def encode_state(
         self,
-        problem,
         state: RLState,
         goal: RLState,
+        radius: int,
     ):
         """
-        Build non-spatial state features for the value MLP.
-
-        Initial features:
-            current velocity magnitude
-            current velocity direction
-            goal velocity magnitude
-            goal velocity direction
+        Encode dynamic state relative to the goal.
+    
+        Features:
+            relative q
+            relative r
+            velocity magnitude
+            direction q
+            direction r
         """
-
+    
+        dq = (
+            state.location.q
+            - goal.location.q
+        ) / radius
+    
+        dr = (
+            state.location.r
+            - goal.location.r
+        ) / radius
+    
         if state.velocity.direction is None:
-            direction_q = 0
-            direction_r = 0
+            direction_q = 0.0
+            direction_r = 0.0
         else:
-            direction = problem.DIRECTIONS[
-                state.velocity.direction
-            ]
+            direction_q = state.velocity.direction.q
+            direction_r = state.velocity.direction.r
     
-            direction_q = direction.q
-            direction_r = direction.r
-    
-        return [
-            state.location.q,
-            state.location.r,
-            state.velocity.magnitude,
-            direction_q,
-            direction_r,
-        ]
+        return torch.tensor(
+            [
+                dq,
+                dr,
+                state.velocity.magnitude,
+                direction_q,
+                direction_r,
+            ],
+            dtype=torch.float32,
+        )
 
     def location_index(
         self,
@@ -910,6 +977,8 @@ class HUNetTDTrainer(TDTrainer):
         learning_rate=1e-3,
         gamma=1.0,
         target_update_every=100,
+        solution_weight=1.0,
+        nonterminal_weight=0.0,
     ):
         super().__init__(
             model=model,
@@ -918,91 +987,176 @@ class HUNetTDTrainer(TDTrainer):
             gamma=gamma,
             target_update_every=target_update_every,
         )
-
+    
         self.environment_store = environment_store
+    
+        self.solution_weight = solution_weight
+        self.nonterminal_weight = nonterminal_weight
 
     def train_step(
         self,
         problem,
         batch_size=64,
     ):
-        experiences = self.replay_buffer.sample(
-            batch_size
+        solution_samples, nonterminal_samples = (
+            self.replay_buffer.sample_mixed(
+                batch_size=batch_size,
+                solution_weight=self.solution_weight,
+                nonterminal_weight=self.nonterminal_weight,
+            )
         )
+    
+        # losses = []
+        # solution_losses = []
+        # td_losses = []
+        losses = []
+        grounded_losses = []
+        nonterminal_losses = []
+    
+        # ---------------------------------------------------------
+        # Grounded solution targets
+        # ---------------------------------------------------------
+    
+        for sample in solution_samples:
+    
+            environment = self.environment_store.get(
+                sample.environment_id
+            )
+    
+            prediction = self.model.value(
+                problem=problem,
+                state=sample.state,
+                goal=sample.goal,
+                environment=environment,
+            )
+    
+            target = torch.tensor(
+                sample.target,
+                dtype=torch.float32,
+                device=prediction.device,
+            )
+    
+            sample_loss = (
+                prediction - target
+            ).pow(2)
+            
 
-        if not experiences:
-            return 0.0
+            losses.append(sample_loss)
+            grounded_losses.append(sample_loss)
 
-        predictions = []
-        targets = []
-
-        for exp in experiences:
-
+        # ---------------------------------------------------------
+        # Nonterminal / TD targets
+        # ---------------------------------------------------------
+    
+        for exp in nonterminal_samples:
+    
             environment = self.environment_store.get(
                 exp.environment_id
             )
-
-            # J(s, goal, environment)
+    
             prediction = self.model.value(
-                problem,
-                exp.state,
-                exp.goal,
-                environment,
-            ).squeeze()
-
+                problem=problem,
+                state=exp.state,
+                goal=exp.goal,
+                environment=environment,
+            )
+    
             if exp.terminal:
-                target = exp.cost
-
+                target = torch.tensor(
+                    exp.cost,
+                    dtype=torch.float32,
+                    device=prediction.device,
+                )
+    
             else:
                 with torch.no_grad():
                     next_value = self.target_model.value(
-                        problem,
-                        exp.next_state,
-                        exp.goal,
-                        environment,
-                    ).squeeze()
-
-                    target = (
-                        exp.cost
-                        + self.gamma * next_value.item()
+                        problem=problem,
+                        state=exp.next_state,
+                        goal=exp.goal,
+                        environment=environment,
                     )
+    
+                target = (
+                    exp.cost
+                    + self.gamma * next_value
+                )
+    
+            sample_loss = (
+                prediction - target
+            ).pow(2)
+            
+            losses.append(sample_loss)
+            nonterminal_losses.append(sample_loss)
 
-            predictions.append(prediction)
-            targets.append(target)
-
-        predictions = torch.stack(predictions)
-
-        targets = torch.tensor(
-            targets,
-            dtype=torch.float32,
-        )
-
-        loss = self.loss_fn(
-            predictions,
-            targets,
-        )
-
+    
+        # ---------------------------------------------------------
+        # No samples available
+        # ---------------------------------------------------------
+    
+        if not losses:
+            return {
+                "loss": 0.0,
+                "grounded_loss": 0.0,
+                "nonterminal_loss": 0.0,
+                "grounded_samples": 0,
+                "nonterminal_samples": 0,
+            }
+    
+        # ---------------------------------------------------------
+        # ONE loss across the sampled mixture
+        # ---------------------------------------------------------
+    
+        loss = torch.stack(
+            losses
+        ).mean()
+    
+        # ---------------------------------------------------------
+        # ONE optimizer / ONE learning rate
+        # ---------------------------------------------------------
+    
         self.optimizer.zero_grad()
-
+    
         loss.backward()
-
+    
         self.optimizer.step()
-
+    
         self.training_steps += 1
-
+    
         if (
             self.training_steps
             % self.target_update_every
             == 0
         ):
             self.update_target_network()
-
+    
+        # ---------------------------------------------------------
+        # Metrics only
+        # ---------------------------------------------------------
+        grounded_loss = (
+            torch.stack(
+                grounded_losses
+            ).mean().item()
+            if grounded_losses
+            else 0.0
+        )
+        
+        nonterminal_loss = (
+            torch.stack(
+                nonterminal_losses
+            ).mean().item()
+            if nonterminal_losses
+            else 0.0
+        )
+        
         return {
             "loss": loss.item(),
-            "mean_prediction": predictions.mean().item(),
-            "mean_target": targets.mean().item(),
+            "grounded_loss": grounded_loss,
+            "nonterminal_loss": nonterminal_loss,
+            "grounded_samples": len(solution_samples),
+            "nonterminal_samples": len(nonterminal_samples),
         }
-
+        
     def train_solution(
         self,
         problem,
@@ -1043,6 +1197,46 @@ class HUNetTDTrainer(TDTrainer):
         self.optimizer.step()
     
         return loss.item()
+
+    def solution_loss(
+        self,
+        problem,
+        batch_size=64,
+    ):
+        samples = self.replay_buffer.sample_solution(
+            batch_size
+        )
+    
+        if not samples:
+            return None
+    
+        losses = []
+    
+        for sample in samples:
+    
+            environment = self.environment_store.get(
+                sample.environment_id
+            )
+    
+            prediction = self.model.value(
+                problem=problem,
+                state=sample.state,
+                goal=sample.goal,
+                environment=environment,
+            )
+    
+            target = torch.tensor(
+                sample.target,
+                dtype=torch.float32,
+                device=prediction.device,
+            )
+    
+            losses.append(
+                (prediction - target).pow(2)
+            )
+    
+        return torch.stack(losses).mean()
+        
 class EnvironmentStore:
     """Store environments separately from Experience objects."""
 
@@ -1064,6 +1258,11 @@ class EnvironmentStore:
     def load(self, filepath):
         """Load environments from disk."""
         raise NotImplementedError
+
+    def ids(self):
+        return list(
+            self.environments.keys()
+        )
 
     def __len__(self):
         return len(self.environments)
@@ -1206,3 +1405,18 @@ def group_experiences_by_state(
         groups[key].append(exp)
 
     return groups
+
+def _to_rl_velocity(
+    problem,
+    velocity,
+):
+    direction = (
+        None
+        if velocity.direction is None
+        else problem.DIRECTIONS[velocity.direction]
+    )
+
+    return VelocityState(
+        magnitude=velocity.magnitude,
+        direction=direction,
+    )
