@@ -21,11 +21,22 @@ import torch
 import torch.nn as nn
 
 
-from hexgrid import RLState, euclid_center_distance, VelocityState
 from collections import defaultdict
 
 
 from unet.hexunet_model import HexUNet
+
+import os
+import pickle
+from pathlib import Path
+
+from hexgrid import (
+    HexCoord,
+    HexGrid,
+    RLState,
+    VelocityState,
+    euclid_center_distance,
+)
 
 
 # Experience + Reply buffer 
@@ -324,7 +335,7 @@ class ValueNetwork_DNN(nn.Module):
             nn.Linear(64, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
-            nn.Softplus(),
+            #nn.Softplus(),
         )
 
     def forward(self, x):
@@ -398,7 +409,7 @@ class ValueNetwork_HUNet(nn.Module):
             nn.ReLU(),
 
             nn.Linear(64, 1),
-            nn.Softplus(),
+            #nn.Softplus(),
         )
 
     def forward(
@@ -423,73 +434,83 @@ class ValueNetwork_HUNet(nn.Module):
     ):
         """
         Produce one context vector per spatial location.
-
-        Returns:
-            [1, spatial_channels, H, W]
+    
+        The encoder is device-agnostic. The resulting tensor is moved
+        to the device currently used by this model.
         """
-
+    
         spatial_input = self.encoder.encode_spatial(
             environment,
             goal.location,
             environment.center,
             environment.radius,
         )
-
-        spatial_input = spatial_input.unsqueeze(0)
-
-        return self.hunet(spatial_input)
-    def encode_state(
-        self,
-        state,
-        goal,
-        environment,
-    ):
-        scale = float(environment.radius)
     
-        dq = (
-            state.location.q
-            - goal.location.q
-        ) / scale
+        device = next(
+            self.parameters()
+        ).device
     
-        dr = (
-            state.location.r
-            - goal.location.r
-        ) / scale
-    
-        velocity = state.velocity.magnitude
-    
-        if state.velocity.direction is None:
-            direction_q = 0.0
-            direction_r = 0.0
-        else:
-            direction_q = float(
-                state.velocity.direction.q
-            )
-    
-            direction_r = float(
-                state.velocity.direction.r
-            )
-    
-            direction_scale = max(
-                abs(direction_q),
-                abs(direction_r),
-                abs(direction_q + direction_r),
-                1.0,
-            )
-    
-            direction_q /= direction_scale
-            direction_r /= direction_scale
-    
-        return torch.tensor(
-            [
-                dq,
-                dr,
-                velocity,
-                direction_q,
-                direction_r,
-            ],
-            dtype=torch.float32,
+        spatial_input = (
+            spatial_input
+            .unsqueeze(0)
+            .to(device)
         )
+    
+        return self.hunet(
+            spatial_input
+        )
+    # def encode_state(
+    #     self,
+    #     state,
+    #     goal,
+    #     environment,
+    # ):
+    #     scale = float(environment.radius)
+    
+    #     dq = (
+    #         state.location.q
+    #         - goal.location.q
+    #     ) / scale
+    
+    #     dr = (
+    #         state.location.r
+    #         - goal.location.r
+    #     ) / scale
+    
+    #     velocity = state.velocity.magnitude
+    
+    #     if state.velocity.direction is None:
+    #         direction_q = 0.0
+    #         direction_r = 0.0
+    #     else:
+    #         direction_q = float(
+    #             state.velocity.direction.q
+    #         )
+    
+    #         direction_r = float(
+    #             state.velocity.direction.r
+    #         )
+    
+    #         direction_scale = max(
+    #             abs(direction_q),
+    #             abs(direction_r),
+    #             abs(direction_q + direction_r),
+    #             1.0,
+    #         )
+    
+    #         direction_q /= direction_scale
+    #         direction_r /= direction_scale
+    
+    #     return torch.tensor(
+    #         [
+    #             dq,
+    #             dr,
+    #             velocity,
+    #             direction_q,
+    #             direction_r,
+    #         ],
+    #         dtype=torch.float32,
+    #     )
 
     def value(
         self,
@@ -509,20 +530,12 @@ class ValueNetwork_HUNet(nn.Module):
                 goal,
             )
 
-        center = environment.center
-        radius = environment.radius
-
-        row = (
-            state.location.r
-            - center.r
-            + radius
+        row, col = self.encoder.location_index(
+            state=state,
+            center=environment.center,
+            radius=environment.radius,
         )
 
-        col = (
-            state.location.q
-            - center.q
-            + radius
-        )
 
         # [1, C]
         context = context_map[
@@ -846,6 +859,7 @@ class TDTrainer:
         )
 
         self.replay_buffer = replay_buffer
+
         self.gamma = gamma
         self.target_update_every = target_update_every
         self.training_steps = 0
@@ -857,111 +871,139 @@ class TDTrainer:
 
         self.loss_fn = nn.MSELoss()
 
-
-    def train_step(
+    def checkpoint_state(
         self,
-        problem,
-        batch_size: int = 64,
-    ) -> float:
+    ):
+        """Return the persistent trainer state."""
 
-        experiences = self.replay_buffer.sample(batch_size)
+        return {
+            "model_state_dict": (
+                self.model.state_dict()
+            ),
 
-        if not experiences:
-            return 0.0
+            "target_model_state_dict": (
+                self.target_model.state_dict()
+            ),
 
-        predictions = []
-        targets = []
+            "optimizer_state_dict": (
+                self.optimizer.state_dict()
+            ),
 
-        for exp in experiences:
+            "training_steps": (
+                self.training_steps
+            ),
 
-            # -------------------------------------------------------------
-            # Current estimate: J(s, goal)
-            # Uses the actively trained network.
-            # -------------------------------------------------------------
+            "gamma": (
+                self.gamma
+            ),
 
-            state_features = self.model.encoder.encode(
-                problem,
-                exp.state,
-                exp.goal,
-            )
+            "target_update_every": (
+                self.target_update_every
+            ),
+        }
 
-            state_tensor = torch.tensor(
-                state_features,
-                dtype=torch.float32,
-            )
+    def load_checkpoint_state(
+        self,
+        checkpoint,
+    ):
+        """Restore persistent trainer state."""
 
-            prediction = self.model(
-                state_tensor
-            ).squeeze()
-
-            # -------------------------------------------------------------
-            # TD target
-            # -------------------------------------------------------------
-
-            if exp.terminal:
-                # J(goal) = 0
-                target = exp.cost
-
-            else:
-                next_features = self.target_model.encoder.encode(
-                    problem,
-                    exp.next_state,
-                    exp.goal,
-                )
-
-                next_tensor = torch.tensor(
-                    next_features,
-                    dtype=torch.float32,
-                )
-
-                with torch.no_grad():
-                    next_value = self.target_model(
-                        next_tensor
-                    ).squeeze()
-
-                target = (
-                    exp.cost
-                    + self.gamma * next_value.item()
-                )
-
-            predictions.append(prediction)
-            targets.append(target)
-
-        # -------------------------------------------------------------
-        # Train online network
-        # -------------------------------------------------------------
-
-        predictions = torch.stack(predictions)
-
-        targets = torch.tensor(
-            targets,
-            dtype=torch.float32,
+        self.model.load_state_dict(
+            checkpoint[
+                "model_state_dict"
+            ]
         )
 
-        loss = self.loss_fn(
-            predictions,
-            targets,
+        self.target_model.load_state_dict(
+            checkpoint[
+                "target_model_state_dict"
+            ]
         )
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        self.optimizer.load_state_dict(
+            checkpoint[
+                "optimizer_state_dict"
+            ]
+        )
 
-        self.training_steps += 1
+        self.training_steps = checkpoint.get(
+            "training_steps",
+            0,
+        )
 
-        # -------------------------------------------------------------
-        # Periodically synchronize target network
-        # -------------------------------------------------------------
+        self.gamma = checkpoint.get(
+            "gamma",
+            self.gamma,
+        )
 
-        if self.training_steps % self.target_update_every == 0:
+        self.target_update_every = checkpoint.get(
+            "target_update_every",
+            self.target_update_every,
+        )
+
+    def save_checkpoint(
+        self,
+        filepath,
+    ):
+        """Save the complete trainer state."""
+
+        torch.save(
+            self.checkpoint_state(),
+            filepath,
+        )
+
+    def load_checkpoint(
+        self,
+        filepath,
+        map_location=None,
+    ):
+        """Load a previously saved trainer checkpoint."""
+
+        checkpoint = torch.load(
+            filepath,
+            map_location=map_location,
+            weights_only=False,
+        )
+
+        self.load_checkpoint_state(
+            checkpoint
+        )
+
+        return checkpoint
+
+    def save_weights(
+        self,
+        filepath,
+    ):
+        """Save only the online value-network weights."""
+
+        torch.save(
+            self.model.state_dict(),
+            filepath,
+        )
+
+    def load_weights(
+        self,
+        filepath,
+        map_location=None,
+        sync_target=True,
+    ):
+        """Load online model weights."""
+
+        state_dict = torch.load(
+            filepath,
+            map_location=map_location,
+            weights_only=True,
+        )
+
+        self.model.load_state_dict(
+            state_dict
+        )
+
+        if sync_target:
             self.update_target_network()
 
-        return loss.item()
-
-
     def update_target_network(self):
-        """Copy current ValueNetwork weights into the target network."""
-
         self.target_model.load_state_dict(
             self.model.state_dict()
         )
@@ -1236,38 +1278,430 @@ class HUNetTDTrainer(TDTrainer):
             )
     
         return torch.stack(losses).mean()
+
+    def checkpoint_state(
+        self,
+    ):
+        checkpoint = super().checkpoint_state()
+    
+        checkpoint.update({
+            "solution_weight": (
+                self.solution_weight
+            ),
+    
+            "nonterminal_weight": (
+                self.nonterminal_weight
+            ),
+    
+            "model_config": {
+                "spatial_channels": (
+                    self.model.spatial_channels
+                ),
+    
+                "state_features": (
+                    self.model.state_features
+                ),
+            },
+        })
+    
+        return checkpoint
+    
+    
+    def load_checkpoint_state(
+        self,
+        checkpoint,
+    ):
+        model_config = checkpoint.get(
+            "model_config",
+            {}
+        )
+    
+        spatial_channels = model_config.get(
+            "spatial_channels"
+        )
+    
+        state_features = model_config.get(
+            "state_features"
+        )
+    
+        if (
+            spatial_channels is not None
+            and spatial_channels
+            != self.model.spatial_channels
+        ):
+            raise ValueError(
+                "Checkpoint spatial_channels "
+                f"{spatial_channels} does not match "
+                f"model spatial_channels "
+                f"{self.model.spatial_channels}"
+            )
+    
+        if (
+            state_features is not None
+            and state_features
+            != self.model.state_features
+        ):
+            raise ValueError(
+                "Checkpoint state_features "
+                f"{state_features} does not match "
+                f"model state_features "
+                f"{self.model.state_features}"
+            )
+    
+        super().load_checkpoint_state(
+            checkpoint
+        )
+    
+        self.solution_weight = checkpoint.get(
+            "solution_weight",
+            self.solution_weight,
+        )
+    
+        self.nonterminal_weight = checkpoint.get(
+            "nonterminal_weight",
+            self.nonterminal_weight,
+        )
         
 class EnvironmentStore:
-    """Store environments separately from Experience objects."""
+    """
+    Store HexGrid environments separately from replay experiences.
 
-    def __init__(self):
+    Replay-buffer records reference environments using environment_id.
+    """
+
+    FILE_VERSION = 1
+
+    def __init__(
+        self,
+    ):
         self.environments = {}
 
-    def add(self, environment_id, environment):
-        """Add an environment to the store."""
-        self.environments[environment_id] = environment
+    def add(
+        self,
+        environment_id,
+        environment,
+    ):
+        if not isinstance(
+            environment,
+            HexGrid,
+        ):
+            raise TypeError(
+                "environment must be a HexGrid"
+            )
 
-    def get(self, environment_id):
-        """Return an environment by ID."""
-        return self.environments[environment_id]
+        self.environments[
+            environment_id
+        ] = environment
 
-    def save(self, filepath):
-        """Save all environments to disk."""
-        raise NotImplementedError
+    def get(
+        self,
+        environment_id,
+    ):
+        try:
+            return self.environments[
+                environment_id
+            ]
 
-    def load(self, filepath):
-        """Load environments from disk."""
-        raise NotImplementedError
+        except KeyError as error:
+            raise KeyError(
+                f"Environment ID not found: "
+                f"{environment_id!r}"
+            ) from error
 
-    def ids(self):
+    def save(
+        self,
+        filepath,
+    ):
+        """
+        Save all environments to one binary file.
+
+        The file contains primitive Python data rather than directly
+        pickling HexGrid objects. This makes the format less dependent
+        on the exact HexGrid class implementation.
+        """
+
+        filepath = Path(
+            filepath
+        )
+
+        filepath.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        serialized_environments = {}
+
+        for (
+            environment_id,
+            environment,
+        ) in self.environments.items():
+
+            obstacles = environment.obstacles
+
+            if isinstance(
+                obstacles,
+                dict,
+            ):
+                obstacle_coordinates = list(
+                    obstacles.keys()
+                )
+
+            else:
+                obstacle_coordinates = list(
+                    obstacles
+                )
+
+            allowed = (
+                None
+                if environment.allowed is None
+                else list(
+                    environment.allowed
+                )
+            )
+
+            serialized_environments[
+                environment_id
+            ] = {
+                "hex_size": (
+                    environment.hex_size
+                ),
+                "obstacles": (
+                    obstacle_coordinates
+                ),
+                "center": (
+                    environment.center
+                ),
+                "radius": (
+                    environment.radius
+                ),
+                "allowed": allowed,
+            }
+
+        payload = {
+            "version": self.FILE_VERSION,
+            "environments": (
+                serialized_environments
+            ),
+        }
+
+        temporary_path = filepath.with_suffix(
+            filepath.suffix + ".tmp"
+        )
+
+        with temporary_path.open(
+            "wb"
+        ) as file:
+            pickle.dump(
+                payload,
+                file,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+
+        os.replace(
+            temporary_path,
+            filepath,
+        )
+
+        return filepath
+
+    def load(
+        self,
+        filepath,
+        clear_existing=True,
+    ):
+        """
+        Load environments from a file created by save().
+
+        Parameters
+        ----------
+        filepath:
+            Saved environment-store file.
+
+        clear_existing:
+            If True, replace the current store.
+            If False, merge loaded environments into the store.
+            Loaded IDs replace existing environments with matching IDs.
+
+        Returns
+        -------
+        EnvironmentStore
+            This EnvironmentStore instance.
+        """
+
+        filepath = Path(
+            filepath
+        )
+
+        if not filepath.is_file():
+            raise FileNotFoundError(
+                f"Environment store not found: "
+                f"{filepath}"
+            )
+
+        with filepath.open(
+            "rb"
+        ) as file:
+            payload = pickle.load(
+                file
+            )
+
+        if not isinstance(
+            payload,
+            dict,
+        ):
+            raise ValueError(
+                "Invalid environment-store file"
+            )
+
+        version = payload.get(
+            "version"
+        )
+
+        if version != self.FILE_VERSION:
+            raise ValueError(
+                "Unsupported environment-store "
+                f"version: {version!r}"
+            )
+
+        serialized_environments = (
+            payload.get(
+                "environments"
+            )
+        )
+
+        if not isinstance(
+            serialized_environments,
+            dict,
+        ):
+            raise ValueError(
+                "Environment-store file does not "
+                "contain an environments dictionary"
+            )
+
+        loaded_environments = {}
+
+        for (
+            environment_id,
+            environment_data,
+        ) in serialized_environments.items():
+
+            required_fields = {
+                "hex_size",
+                "obstacles",
+                "center",
+                "radius",
+                "allowed",
+            }
+
+            missing_fields = (
+                required_fields
+                - environment_data.keys()
+            )
+
+            if missing_fields:
+                raise ValueError(
+                    "Environment "
+                    f"{environment_id!r} is missing "
+                    f"fields: {sorted(missing_fields)}"
+                )
+
+            center = environment_data[
+                "center"
+            ]
+
+            if not isinstance(
+                center,
+                HexCoord,
+            ):
+                raise ValueError(
+                    "Environment "
+                    f"{environment_id!r} has an "
+                    "invalid center"
+                )
+
+            obstacles = {
+                coordinate: True
+                for coordinate
+                in environment_data[
+                    "obstacles"
+                ]
+            }
+
+            allowed_data = environment_data[
+                "allowed"
+            ]
+
+            allowed = (
+                None
+                if allowed_data is None
+                else set(
+                    allowed_data
+                )
+            )
+
+            loaded_environments[
+                environment_id
+            ] = HexGrid(
+                hex_size=environment_data[
+                    "hex_size"
+                ],
+                obstacles=obstacles,
+                center=center,
+                radius=environment_data[
+                    "radius"
+                ],
+                allowed=allowed,
+            )
+
+        if clear_existing:
+            self.environments.clear()
+
+        self.environments.update(
+            loaded_environments
+        )
+
+        return self
+
+    @classmethod
+    def from_file(
+        cls,
+        filepath,
+    ):
+        """
+        Create a new EnvironmentStore from a saved file.
+        """
+
+        store = cls()
+
+        store.load(
+            filepath=filepath,
+            clear_existing=True,
+        )
+
+        return store
+
+    def ids(
+        self,
+    ):
         return list(
             self.environments.keys()
         )
 
-    def __len__(self):
-        return len(self.environments)
+    def __contains__(
+        self,
+        environment_id,
+    ):
+        return (
+            environment_id
+            in self.environments
+        )
 
-
+    def __len__(
+        self,
+    ):
+        return len(
+            self.environments
+        )
 
 #### Helper Functions #### 
 def get_spatial_features(
@@ -1420,3 +1854,132 @@ def _to_rl_velocity(
         magnitude=velocity.magnitude,
         direction=direction,
     )
+
+class HexUNetHeuristic:
+    """
+    Callable H* heuristic backed by ValueNetwork_HUNet.
+
+    The callable preserves the normal H* heuristic interface:
+
+        heuristic(problem, node) -> estimated remaining time
+    """
+
+    def __init__(
+        self,
+        model,
+    ):
+        self.model = model
+
+        self._cached_problem_id = None
+        self._cached_goal = None
+        self._cached_context_map = None
+
+    def clear_cache(
+        self,
+    ):
+        self._cached_problem_id = None
+        self._cached_goal = None
+        self._cached_context_map = None
+
+    def _get_context_map(
+        self,
+        problem,
+        goal,
+    ):
+        problem_id = id(problem)
+
+        if (
+            self._cached_context_map is None
+            or self._cached_problem_id != problem_id
+            or self._cached_goal != goal.location
+        ):
+            self._cached_context_map = (
+                self.model.encode_environment(
+                    environment=problem.grid,
+                    goal=goal,
+                )
+            )
+
+            self._cached_problem_id = problem_id
+            self._cached_goal = goal.location
+
+        return self._cached_context_map
+
+    def __call__(
+        self,
+        problem,
+        node,
+    ):
+        """
+        Estimate remaining physical travel time from node to goal.
+        """
+
+        state_direction = (
+            None
+            if node.velocity.direction is None
+            else problem.DIRECTIONS[
+                node.velocity.direction
+            ]
+        )
+
+        goal_direction = (
+            None
+            if (
+                problem.goal_v is None
+                or problem.goal_v.direction is None
+            )
+            else problem.DIRECTIONS[
+                problem.goal_v.direction
+            ]
+        )
+
+        state = RLState(
+            location=node.location,
+            velocity=VelocityState(
+                magnitude=node.velocity.magnitude,
+                direction=state_direction,
+            ),
+        )
+
+        goal = RLState(
+            location=problem.goal,
+            velocity=VelocityState(
+                magnitude=(
+                    None
+                    if problem.goal_v is None
+                    else problem.goal_v.magnitude
+                ),
+                direction=goal_direction,
+            ),
+        )
+
+        was_training = self.model.training
+
+        self.model.eval()
+
+        try:
+            with torch.no_grad():
+                context_map = self._get_context_map(
+                    problem=problem,
+                    goal=goal,
+                )
+
+                prediction = self.model.value(
+                    problem=problem,
+                    state=state,
+                    goal=goal,
+                    environment=problem.grid,
+                    context_map=context_map,
+                )
+
+            # Clamp output, we do not ever want <0 h values
+            return max(
+                0.0,
+                float(
+                    prediction.item()
+                ),
+            )
+
+        finally:
+            if was_training:
+                self.model.train()

@@ -1,0 +1,17 @@
+*.ipynb
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+hunet_pretraining_outputs/
+rl_checkpoints/
+*.pt
+*.pth
+*.ckpt
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
